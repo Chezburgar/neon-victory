@@ -15,6 +15,7 @@ const ST = { LOBBY: 0, COUNT: 1, PLAY: 2, GOAL: 3, END: 4 };
 const v1 = new THREE.Vector3(), v2 = new THREE.Vector3(), v3 = new THREE.Vector3();
 const v4 = new THREE.Vector3(), v5 = new THREE.Vector3(), v6 = new THREE.Vector3();
 const hTmp = new THREE.Vector3(), hDir = new THREE.Vector3(), headPos = new THREE.Vector3();
+const qTmp = new THREE.Quaternion();
 const aimObj = new THREE.Object3D();
 
 let state = ST.LOBBY, stateT = 0, mode = 'match';
@@ -548,8 +549,8 @@ function drawPanel() {
   }
   x.fillStyle = '#89aed6'; x.font = '600 25px Arial'; x.textAlign = 'center';
   const lines = [
-    'GRIP grab & fling  ·  TRIGGER wrist boost  ·  A/X brake  ·  stick-L thrust  ·  stick-R turn',
-    'PUNCH fast to STUN  ·  throw the disc through the far ring to SCORE  ·  hold B/Y: lobby',
+    'GRIP grab & fling — walls, rails, even players  ·  TRIGGER wrist boost  ·  A/X brake  ·  stick-R turn',
+    'PUNCH fast to STUN  ·  throw the disc through the far ring to SCORE  ·  MENU / hold B-Y: lobby',
     'Desktop: drag look · WASD + Space/C fly · Shift brake · E grab/throw · F punch · Enter start'
   ];
   lines.forEach((l, i) => x.fillText(l, W / 2, 650 + i * 36));
@@ -843,8 +844,8 @@ const particles = (() => {
 // ---------------------------------------------------------------- disc
 const disc = {
   state: 'free', holder: null, noCatchT: 0,
-  pos: new THREE.Vector3(0, 0, 0), vel: new THREE.Vector3(), prevZ: 0,
-  spin: 4, mesh: null, glow: null
+  pos: new THREE.Vector3(0, 0, 0), vel: new THREE.Vector3(), prevPos: new THREE.Vector3(),
+  spin: 4, yaw: 0, mesh: null, glow: null
 };
 {
   const g = new THREE.Group();
@@ -906,8 +907,8 @@ function dropDisc(vel) {
   disc.noCatchT = 0.35;
 }
 function throwDiscFromHand(h) {
-  v1.copy(h.vel).multiplyScalar(1.25);
-  if (v1.length() > 21) v1.setLength(21);
+  v1.copy(h.vel).lerp(h.velS, 0.35).multiplyScalar(1.25);
+  if (v1.length() > 20) v1.setLength(20);
   dropDisc(v1);
   disc.spin = 6 + v1.length();
   whoosh(Math.min(0.45, 0.1 + v1.length() * 0.02));
@@ -916,32 +917,112 @@ function throwDiscFromHand(h) {
 
 // ---------------------------------------------------------------- bots
 const bots = [];
+const botMat = new THREE.MeshBasicMaterial({ vertexColors: true });
+function dimHex(hex, f) { return new THREE.Color(hex).multiplyScalar(f).getHex(); }
+function cylZ(r, len) { const g = new THREE.CylinderGeometry(r, r, len, 10); g.rotateX(Math.PI / 2); return g; }
+// bake a list of colored primitive parts into one vertex-colored geometry (1 draw call)
+function mergeParts(parts) {
+  const mat4 = new THREE.Matrix4(), eul = new THREE.Euler(), q = new THREE.Quaternion();
+  const s = new THREE.Vector3(), t = new THREE.Vector3(), c = new THREE.Color();
+  const gs = [];
+  let vtx = 0;
+  for (const p of parts) {
+    const g = p.geo.toNonIndexed();
+    eul.set(p.rx || 0, p.ry || 0, p.rz || 0);
+    q.setFromEuler(eul);
+    s.set(p.sx ?? 1, p.sy ?? 1, p.sz ?? 1);
+    t.set(p.x || 0, p.y || 0, p.z || 0);
+    mat4.compose(t, q, s);
+    g.applyMatrix4(mat4);
+    const n = g.attributes.position.count;
+    const cols = new Float32Array(n * 3);
+    c.setHex(p.color);
+    for (let i = 0; i < n; i++) { cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b; }
+    g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    gs.push(g);
+    vtx += n;
+    p.geo.dispose();
+  }
+  const pos = new Float32Array(vtx * 3), col = new Float32Array(vtx * 3);
+  let o = 0;
+  for (const g of gs) {
+    pos.set(g.attributes.position.array, o * 3);
+    col.set(g.attributes.color.array, o * 3);
+    o += g.attributes.position.count;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return out;
+}
+function buildBotGeos(teamHex) {
+  const T = teamHex, TD = dimHex(teamHex, 0.45);
+  const A = 0x10182b, B = 0x1a2440, M = 0x232f52;
+  const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+  const sph = (r, ws = 10, hs = 8) => new THREE.SphereGeometry(r, ws, hs);
+  const body = mergeParts([
+    // pelvis + waist glow
+    { geo: box(0.3, 0.18, 0.2), color: A, y: -0.44 },
+    { geo: box(0.32, 0.05, 0.22), color: T, y: -0.33 },
+    // chest / abdomen / collar
+    { geo: box(0.44, 0.34, 0.26), color: M, y: 0.02 },
+    { geo: box(0.34, 0.2, 0.22), color: A, y: -0.2 },
+    { geo: box(0.3, 0.08, 0.2), color: A, y: 0.24 },
+    // chest core ring (faces forward)
+    { geo: new THREE.TorusGeometry(0.08, 0.024, 6, 20), color: T, y: 0.06, z: 0.14 },
+    // helmet + visor + jaw vent
+    { geo: sph(0.145, 12, 10), color: B, y: 0.43, sy: 1.12, sz: 1.05 },
+    { geo: box(0.23, 0.075, 0.05), color: T, y: 0.44, z: 0.115 },
+    { geo: box(0.12, 0.05, 0.08), color: A, y: 0.31, z: 0.08 },
+    // shoulder pads
+    { geo: sph(0.095, 8, 6), color: M, x: 0.28, y: 0.18, sy: 0.75 },
+    { geo: sph(0.095, 8, 6), color: M, x: -0.28, y: 0.18, sy: 0.75 },
+    // thruster backpack + spine glow + nozzles
+    { geo: box(0.3, 0.36, 0.14), color: A, y: 0.04, z: -0.2 },
+    { geo: box(0.04, 0.3, 0.02), color: TD, y: 0.04, z: -0.28 },
+    { geo: cylZ(0.05, 0.1), color: B, x: 0.09, y: -0.08, z: -0.3 },
+    { geo: cylZ(0.05, 0.1), color: B, x: -0.09, y: -0.08, z: -0.3 },
+    { geo: box(0.07, 0.07, 0.03), color: T, x: 0.09, y: -0.08, z: -0.36 },
+    { geo: box(0.07, 0.07, 0.03), color: T, x: -0.09, y: -0.08, z: -0.36 },
+    // legs in a relaxed zero-g pose
+    { geo: box(0.14, 0.32, 0.16), color: B, x: 0.1, y: -0.64, z: 0.03, rx: 0.3 },
+    { geo: box(0.14, 0.32, 0.16), color: B, x: -0.1, y: -0.64, z: 0.03, rx: 0.3 },
+    { geo: box(0.115, 0.3, 0.13), color: A, x: 0.11, y: -0.92, z: -0.05, rx: -0.35 },
+    { geo: box(0.115, 0.3, 0.13), color: A, x: -0.11, y: -0.92, z: -0.05, rx: -0.35 },
+    { geo: box(0.13, 0.09, 0.22), color: B, x: 0.11, y: -1.08 },
+    { geo: box(0.13, 0.09, 0.22), color: B, x: -0.11, y: -1.08 },
+    { geo: box(0.14, 0.025, 0.23), color: T, x: 0.11, y: -1.03 },
+    { geo: box(0.14, 0.025, 0.23), color: T, x: -0.11, y: -1.03 }
+  ]);
+  const armGeo = () => mergeParts([
+    { geo: sph(0.07, 8, 6), color: M },
+    { geo: box(0.1, 0.26, 0.12), color: B, y: -0.17, z: 0.02, rx: 0.25 },
+    { geo: sph(0.06, 8, 6), color: A, y: -0.31, z: 0.06 },
+    { geo: box(0.09, 0.24, 0.11), color: M, y: -0.44, z: 0.13, rx: 0.55 },
+    { geo: box(0.11, 0.05, 0.13), color: T, y: -0.55, z: 0.19 },
+    { geo: box(0.09, 0.11, 0.14), color: B, y: -0.63, z: 0.24 }
+  ]);
+  return { body, armL: armGeo(), armR: armGeo() };
+}
+const BOT_GEOS = { blue: buildBotGeos(BLUE), orange: buildBotGeos(ORANGE) };
 function makeBot(team, idx) {
   const col = team === 'blue' ? BLUE : ORANGE;
   const g = new THREE.Group();
-  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.24, 0.34, 4, 10), new THREE.MeshBasicMaterial({ color: 0x131a2c }));
-  g.add(torso);
-  const chest = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.12, 0.03), new THREE.MeshBasicMaterial({ color: col, fog: false }));
-  chest.position.set(0, 0.08, 0.24);
-  g.add(chest);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 10), new THREE.MeshBasicMaterial({ color: 0x0e1526 }));
-  head.position.y = 0.46;
-  g.add(head);
-  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.07, 0.07), new THREE.MeshBasicMaterial({ color: col, fog: false }));
-  visor.position.set(0, 0.48, 0.12);
-  g.add(visor);
-  for (const s of [-1, 1]) {
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.22, 0.16), new THREE.MeshBasicMaterial({ color: 0x1b2c4a }));
-    fin.position.set(s * 0.3, 0.18, -0.05);
-    g.add(fin);
-  }
+  const geos = BOT_GEOS[team];
+  g.add(new THREE.Mesh(geos.body, botMat));
+  const armL = new THREE.Mesh(geos.armL, botMat);
+  armL.position.set(-0.3, 0.18, 0);
+  g.add(armL);
+  const armR = new THREE.Mesh(geos.armR, botMat);
+  armR.position.set(0.3, 0.18, 0);
+  g.add(armR);
   const thr = new THREE.Sprite(new THREE.SpriteMaterial({ map: disc.glowTex, color: col, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
-  thr.position.set(0, -0.42, -0.12);
+  thr.position.set(0, -0.15, -0.42);
   thr.scale.setScalar(0.01);
   g.add(thr);
   scene.add(g);
   const bot = {
-    team, idx, group: g, thr,
+    team, idx, group: g, thr, armL, armR,
     pos: new THREE.Vector3(), vel: new THREE.Vector3(),
     stunT: 0, punchT: 0, catchCd: 0, holdsDisc: false, holdT: 0, aimT: 0,
     role: 'mid', lane: idx === 0 ? 0 : (idx === 1 ? -1 : 1), phase: Math.random() * 9,
@@ -1087,7 +1168,7 @@ function stunPlayer(byBot) {
     v1.addScaledVector(v2, 1.5);
     dropDisc(v1);
   }
-  if (pv.grabHand >= 0) pv.grabHand = -1;
+  if (pv.grabHand >= 0) { pv.grabHand = -1; pv.grabBot = null; }
   stunQuad.material.opacity = 0.4;
   zap(0.5);
   hapticPulse(0, 1, 300); hapticPulse(1, 1, 300);
@@ -1107,6 +1188,8 @@ function updateBots(dt) {
       resolveSphere(b.pos, 0.42, b.vel, 0.3);
       b.group.position.copy(b.pos);
       b.group.rotation.z += 3 * dt;
+      b.armL.rotation.x = Math.sin(time * 13) * 0.7;
+      b.armR.rotation.x = Math.sin(time * 13 + 2) * 0.7;
       if (Math.random() < dt * 8) particles.spawn(b.pos, 0xfff37a, 2, 1.5);
       b.thr.scale.setScalar(0.01);
       continue;
@@ -1115,10 +1198,10 @@ function updateBots(dt) {
     botTargetFor(b, b.target);
     v1.copy(b.target).sub(b.pos);
     const dist = v1.length();
-    const maxS = b.holdsDisc ? 7 : 7.8;
+    const maxS = b.holdsDisc ? 5.2 : 5.6;
     v1.normalize().multiplyScalar(Math.min(maxS, dist * 1.4));
     v2.copy(v1).sub(b.vel);
-    const steer = Math.min(v2.length(), 13 * dt);
+    const steer = Math.min(v2.length(), 10 * dt);
     b.steer = steer / Math.max(dt, 1e-4);
     v2.normalize().multiplyScalar(steer);
     b.vel.add(v2);
@@ -1165,14 +1248,19 @@ function updateBots(dt) {
       aimObj.lookAt(v1);
       b.group.quaternion.slerp(aimObj.quaternion, 0.08);
     }
-    b.thr.scale.setScalar(0.05 + Math.min(0.5, b.steer * 0.04));
+    const spd = b.vel.length();
+    const pose = Math.min(1, spd / 4.5) * -1.15; // arms sweep back at speed
+    b.armL.rotation.x = pose + Math.sin(time * 2.1 + b.phase) * 0.12;
+    b.armR.rotation.x = pose + Math.sin(time * 2.1 + b.phase + 1.7) * 0.12;
+    b.thr.scale.setScalar(0.08 + Math.min(0.6, b.steer * 0.05));
   }
 }
 
 // ---------------------------------------------------------------- player
 const pv = {
   vel: new THREE.Vector3(), stunT: 0,
-  grabHand: -1, anchor: new THREE.Vector3(), grabVel: new THREE.Vector3()
+  grabHand: -1, grabBot: null, grabOff: new THREE.Vector3(),
+  anchor: new THREE.Vector3(), grabVel: new THREE.Vector3()
 };
 const boostAccel = new THREE.Vector3();
 let brakeHeld = false, totThrottle = 0, toLobbyRequested = false;
@@ -1190,8 +1278,8 @@ for (let i = 0; i < 2; i++) {
     i, ray, grip, gamepad: null, handed: '',
     histP: Array.from({ length: HIST_N }, () => new THREE.Vector3()),
     histT: new Float64Array(HIST_N), histI: 0, histFill: 0,
-    vel: new THREE.Vector3(), gripDown: false, selectDown: false,
-    punchCd: 0, byT: 0, throttle: 0
+    vel: new THREE.Vector3(), velS: new THREE.Vector3(), gripDown: false, selectDown: false,
+    punchCd: 0, byT: 0, menuWas: false, throttle: 0
   };
   hands.push(h);
   ray.addEventListener('connected', e => { h.handed = e.data.handedness || ''; h.gamepad = e.data.gamepad || null; });
@@ -1200,12 +1288,20 @@ for (let i = 0; i < 2; i++) {
   ray.addEventListener('selectend', () => { h.selectDown = false; });
   ray.addEventListener('squeezestart', () => { unlockAudio(); h.gripDown = true; tryGrab(h); });
   ray.addEventListener('squeezeend', () => { h.gripDown = false; releaseGrab(h); });
-  // gauntlet
-  const knuckle = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8), new THREE.MeshBasicMaterial({ color: 0xd8ecff }));
+  // gauntlet: glove + knuckle + wrist band + booster nozzle
+  const glove = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.05, 0.12), new THREE.MeshBasicMaterial({ color: 0x232f52 }));
+  glove.position.set(0, -0.01, 0.02);
+  grip.add(glove);
+  const knuckle = new THREE.Mesh(new THREE.SphereGeometry(0.038, 10, 8), new THREE.MeshBasicMaterial({ color: 0xd8ecff }));
+  knuckle.position.set(0, 0.01, -0.03);
   grip.add(knuckle);
-  const band = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.014, 6, 18), new THREE.MeshBasicMaterial({ color: BLUE, fog: false }));
-  band.rotation.x = Math.PI / 2;
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.052, 0.015, 6, 18), new THREE.MeshBasicMaterial({ color: BLUE, fog: false }));
+  band.position.z = 0.06;
   grip.add(band);
+  const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.022, 0.055, 10), new THREE.MeshBasicMaterial({ color: 0x10182b }));
+  nozzle.rotation.x = Math.PI / 2;
+  nozzle.position.set(0, 0, 0.1);
+  grip.add(nozzle);
   const boostSpr = new THREE.Sprite(new THREE.SpriteMaterial({ map: null, color: 0x9fd8ff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
   boostSpr.scale.setScalar(0.01);
   grip.add(boostSpr);
@@ -1243,6 +1339,7 @@ function updateHandHist(h, dt) {
     if (dtk > 0.1) break;
   }
   if (best >= 0) h.vel.copy(hTmp).sub(h.histP[best]).divideScalar(bestDt);
+  h.velS.lerp(h.vel, 0.35);
 }
 function tryGrab(h) {
   if (state === ST.LOBBY || state === ST.COUNT || pv.stunT > 0) return;
@@ -1251,8 +1348,25 @@ function tryGrab(h) {
     pickupDisc('h' + h.i);
     return;
   }
+  // grab a player (teammate or opponent) — anchor rides along with them
+  let gb = null, gbd = 0.72;
+  for (const b of bots) {
+    if (!b.group.visible) continue;
+    const d = hTmp.distanceTo(b.pos);
+    if (d < gbd) { gbd = d; gb = b; }
+  }
+  if (gb) {
+    pv.grabHand = h.i;
+    pv.grabBot = gb;
+    pv.grabOff.copy(hTmp).sub(gb.pos);
+    pv.grabVel.set(0, 0, 0);
+    hapticPulse(h.i, 0.6, 50);
+    thud(0.18, 420);
+    return;
+  }
   if (surfaceInReach(hTmp, 0.38)) {
     pv.grabHand = h.i;
+    pv.grabBot = null;
     pv.anchor.copy(hTmp);
     pv.grabVel.set(0, 0, 0);
     hapticPulse(h.i, 0.5, 40);
@@ -1266,8 +1380,9 @@ function releaseGrab(h) {
   }
   if (pv.grabHand === h.i) {
     pv.grabHand = -1;
+    pv.grabBot = null;
     pv.vel.copy(pv.grabVel);
-    if (pv.vel.length() > 15) pv.vel.setLength(15);
+    if (pv.vel.length() > 11) pv.vel.setLength(11);
   }
 }
 function onSelect(h) {
@@ -1289,7 +1404,7 @@ function updateVRInput(dt) {
     h.throttle = (pv.stunT > 0 || state === ST.COUNT || state === ST.LOBBY) ? 0 : trig;
     if (h.throttle > 0.04 && pv.grabHand < 0) {
       h.ray.getWorldDirection(hDir).negate();
-      boostAccel.addScaledVector(hDir, 8.5 * h.throttle);
+      boostAccel.addScaledVector(hDir, 3.2 * h.throttle);
       totThrottle += h.throttle;
       if (h.throttle > 0.35 && Math.random() < 0.6) {
         handWorld(h, hTmp);
@@ -1302,18 +1417,18 @@ function updateVRInput(dt) {
       h.byT += dt;
       if (h.byT > 1.2 && state !== ST.LOBBY) { h.byT = -99; toLobbyRequested = true; }
     } else h.byT = 0;
-    const ax = g.axes[2] || 0, ay = g.axes[3] || 0;
+    const ax = g.axes[2] || 0;
     if (h.handed === 'right') {
       if (Math.abs(ax) > 0.6 && snapReady) { snapTurn(Math.sign(ax) * -Math.PI / 4); snapReady = false; }
       if (Math.abs(ax) < 0.3) snapReady = true;
-    } else if (state !== ST.LOBBY && state !== ST.COUNT && pv.stunT <= 0) {
-      if (Math.abs(ax) > 0.15 || Math.abs(ay) > 0.15) {
-        camera.getWorldDirection(v1);
-        v2.crossVectors(v1, UP).normalize();
-        boostAccel.addScaledVector(v2, ax * 6.5);
-        boostAccel.addScaledVector(v1, -ay * 6.5);
-      }
     }
+    // menu button (exposed at index >= 6 on some runtimes) -> return to lobby
+    let menuNow = false;
+    for (let bi = 6; bi < g.buttons.length; bi++) {
+      if (g.buttons[bi] && g.buttons[bi].pressed) { menuNow = true; break; }
+    }
+    if (menuNow && !h.menuWas && state !== ST.LOBBY) toLobbyRequested = true;
+    h.menuWas = menuNow;
     // grip-held catch assist
     if (h.gripDown && disc.state === 'free' && disc.noCatchT <= 0 && state === ST.PLAY && pv.stunT <= 0) {
       handWorld(h, hTmp);
@@ -1352,6 +1467,7 @@ function teleportRig(targetHead, faceDir, feetY = null) {
   }
   pv.vel.set(0, 0, 0);
   pv.grabHand = -1;
+  pv.grabBot = null;
   deskYaw = rig.rotation.y;
 }
 
@@ -1439,7 +1555,7 @@ function updateDesktopInput(dt) {
   if (state === ST.COUNT || pv.stunT > 0) return;
   camera.getWorldDirection(v1);
   v2.crossVectors(v1, UP).normalize();
-  const A = 8.5;
+  const A = 6;
   if (keys.KeyW) boostAccel.addScaledVector(v1, A);
   if (keys.KeyS) boostAccel.addScaledVector(v1, -A);
   if (keys.KeyA) boostAccel.addScaledVector(v2, -A);
@@ -1465,17 +1581,21 @@ function updatePlayerPhysics(dt) {
   const frozen = state === ST.COUNT;
   if (pv.grabHand >= 0 && !frozen && renderer.xr.isPresenting) {
     const h = hands[pv.grabHand];
+    if (pv.grabBot) {
+      pv.anchor.copy(pv.grabBot.pos).add(pv.grabOff);
+      pv.grabBot.vel.multiplyScalar(Math.exp(-0.8 * dt)); // hanging on drags them down
+    }
     handWorld(h, v1);
     v2.copy(pv.anchor).sub(v1);
     rig.position.add(v2);
     v3.copy(v2).divideScalar(Math.max(dt, 1e-4));
-    if (v3.length() > 18) v3.setLength(18);
+    if (v3.length() > 14) v3.setLength(14);
     pv.grabVel.lerp(v3, 0.35);
   } else {
     if (!frozen) pv.vel.addScaledVector(boostAccel, dt);
     if (brakeHeld) pv.vel.multiplyScalar(Math.exp(-5 * dt));
     pv.vel.multiplyScalar(Math.exp(-0.035 * dt));
-    if (pv.vel.length() > 16) pv.vel.setLength(16);
+    if (pv.vel.length() > 9) pv.vel.setLength(9);
     if (!frozen) rig.position.addScaledVector(pv.vel, dt);
   }
   camera.getWorldPosition(headPos);
@@ -1497,7 +1617,7 @@ function updatePunches(dt) {
     handWorld(h, hTmp);
     for (const b of bots) {
       if (b.stunT > 0) continue;
-      if (hTmp.distanceTo(b.pos) < 0.55) {
+      if (hTmp.distanceTo(b.pos) < 0.62) {
         h.punchCd = 0.5;
         v1.copy(h.vel);
         stunBot(b, v1);
@@ -1539,6 +1659,7 @@ function resetDisc() {
   disc.state = 'free'; disc.holder = null;
   disc.pos.set(0, 0, 0);
   disc.vel.set(0, 0, 0);
+  disc.prevPos.copy(disc.pos);
   disc.noCatchT = 0;
   disc.spin = 3;
   for (const b of bots) { b.holdsDisc = false; }
@@ -1584,6 +1705,7 @@ function onGoal(team, end) {
   disc.state = 'scored'; disc.holder = null;
   disc.pos.set(0, 0, end * (GOAL_Z + 0.6));
   disc.vel.set(0, 0, 0);
+  disc.prevPos.copy(disc.pos);
   score[team]++;
   sbMessage = `${teamName(team)} SCORES`;
   sbDirty = true;
@@ -1610,21 +1732,21 @@ function endMatch(winner) {
   sbDirty = true;
 }
 function checkGoalCrossing() {
-  if (state !== ST.PLAY) { disc.prevZ = disc.pos.z; return; }
-  const z = disc.pos.z, pz = disc.prevZ;
+  if (state !== ST.PLAY) { disc.prevPos.copy(disc.pos); return; }
+  const z = disc.pos.z, pz = disc.prevPos.z;
   for (const end of [-1, 1]) {
     const plane = end * GOAL_Z;
     if ((pz - plane) * (z - plane) < 0) {
       const t = (plane - pz) / (z - pz);
-      // approximate x/y at crossing using current pos (positions close between frames)
-      const cx = disc.pos.x, cy = disc.pos.y;
+      const cx = THREE.MathUtils.lerp(disc.prevPos.x, disc.pos.x, t);
+      const cy = THREE.MathUtils.lerp(disc.prevPos.y, disc.pos.y, t);
       if (cx * cx + cy * cy < (GOAL_R - 0.08) * (GOAL_R - 0.08)) {
         onGoal(end < 0 ? 'blue' : 'orange', end);
         return;
       }
     }
   }
-  disc.prevZ = z;
+  disc.prevPos.copy(disc.pos);
 }
 function updateDisc(dt) {
   disc.noCatchT -= dt;
@@ -1653,23 +1775,27 @@ function updateDisc(dt) {
   } else if (disc.state === 'free') {
     if (!frozen) {
       disc.pos.addScaledVector(disc.vel, dt);
-      resolveSphere(disc.pos, 0.16, disc.vel, 0.72);
+      resolveSphere(disc.pos, 0.16, disc.vel, 0.82);
       if (colRes.impact > 2) {
         thud(volAt(disc.pos, Math.min(0.5, colRes.impact * 0.05)), 400 + colRes.impact * 30);
         if (colRes.impact > 4) particles.spawn(disc.pos, 0x54d8ff, 8, 2);
       }
-      disc.vel.multiplyScalar(Math.exp(-0.004 * dt));
       if (disc.vel.length() > 24) disc.vel.setLength(24);
       checkGoalCrossing();
     }
     disc.mesh.position.copy(disc.pos);
-    disc.mesh.rotation.y += disc.spin * dt;
-    disc.spin *= Math.exp(-0.2 * dt);
+    // gyroscopic stabilization: settle flat while spinning for a clean glide
+    disc.yaw += disc.spin * dt;
+    qTmp.setFromAxisAngle(UP, disc.yaw);
+    disc.mesh.quaternion.slerp(qTmp, Math.min(1, 7 * dt));
+    disc.spin *= Math.exp(-0.15 * dt);
     trailPush();
   } else { // scored
     disc.mesh.position.copy(disc.pos);
-    disc.mesh.rotation.y += 4 * dt;
-    disc.prevZ = disc.pos.z;
+    disc.yaw += 4 * dt;
+    qTmp.setFromAxisAngle(UP, disc.yaw);
+    disc.mesh.quaternion.slerp(qTmp, Math.min(1, 7 * dt));
+    disc.prevPos.copy(disc.pos);
   }
   const pulse = 1 + Math.sin(time * 5) * 0.12;
   disc.glow.scale.setScalar(1.1 * pulse);
