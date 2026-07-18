@@ -22,8 +22,8 @@ const aimObj = new THREE.Object3D();
 
 let state = ST.LOBBY, stateT = 0, mode = 'match';
 let score = { blue: 0, orange: 0 }, matchClock = MATCH_TIME, sudden = false;
-let time = 0, countLast = 4, launchPending = false;
-let poseT = 0, discNetT = 0, tickT = 0;
+let time = 0, countLast = 4, launchPending = false, launchT = 0;
+let poseT = 0, discNetT = 0, tickT = 0, calloutT = 0, calloutCd = 0;
 
 // ---------------------------------------------------------------- renderer / rig
 const scene = new THREE.Scene();
@@ -572,25 +572,32 @@ makeGoal(-1); makeGoal(1);
 // ---------------------------------------------------------------- launch tubes
 const TUBE_X = [0, -4, 4], TUBE_Y = -4.4;
 {
-  const tubeGeo = new THREE.CylinderGeometry(0.85, 0.85, 1.9, 16, 1, true);
+  // long chutes that pass through the end wall — players ride them in from behind
+  const tubeGeo = new THREE.CylinderGeometry(0.85, 0.85, 6, 16, 1, true);
   tubeGeo.rotateX(Math.PI / 2);
   const tubeMat = new THREE.MeshBasicMaterial({ color: 0x0e1626, side: THREE.DoubleSide });
   for (const endSign of [-1, 1]) {
     const col = endSign > 0 ? BLUE : ORANGE;
     for (const tx of TUBE_X) {
       const tm = new THREE.Mesh(tubeGeo, tubeMat);
-      tm.position.set(tx, TUBE_Y, endSign * 39.05);
+      tm.position.set(tx, TUBE_Y, endSign * 41.1);
       arena.add(tm);
       const mouth = new THREE.Mesh(new THREE.TorusGeometry(0.85, 0.06, 8, 24),
         new THREE.MeshBasicMaterial({ color: col, fog: false }));
       mouth.position.set(tx, TUBE_Y, endSign * 38.15);
       arena.add(mouth);
+      for (const rz of [39.6, 41.2, 42.8]) {
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.03, 6, 20),
+          new THREE.MeshBasicMaterial({ color: 0x35b6ff, blending: THREE.AdditiveBlending, transparent: true, opacity: 0.7, depthWrite: false, fog: false }));
+        ring.position.set(tx, TUBE_Y, endSign * rz);
+        arena.add(ring);
+      }
     }
   }
 }
 function tubeSpawn(team, slot, out) {
   const endSign = team === 'blue' ? 1 : -1;
-  return out.set(TUBE_X[slot % 3], TUBE_Y, endSign * 39.2);
+  return out.set(TUBE_X[slot % 3], TUBE_Y, endSign * 42.6);
 }
 
 // stars
@@ -1085,8 +1092,8 @@ function dropDisc(vel, broadcast) {
   }
 }
 function throwDiscFromHand(h) {
-  v1.copy(h.vel).lerp(h.velS, 0.35).multiplyScalar(1.25);
-  if (v1.length() > 20) v1.setLength(20);
+  v1.copy(h.vel).lerp(h.velS, 0.35).multiplyScalar(1.1);
+  if (v1.length() > 16) v1.setLength(16);
   dropDisc(v1, true);
   disc.spin = 6 + v1.length();
   whoosh(Math.min(0.45, 0.1 + v1.length() * 0.02));
@@ -1363,7 +1370,7 @@ function botThrowAtGoal(b) {
   const err = 0.35 + d * 0.028;
   v4.x += (Math.random() - 0.5) * 2 * err;
   v4.y += (Math.random() - 0.5) * 2 * err;
-  v1.copy(v4).sub(disc.pos).normalize().multiplyScalar(15);
+  v1.copy(v4).sub(disc.pos).normalize().multiplyScalar(13);
   b.holdsDisc = false;
   dropDisc(v1);
   disc.spin = 16;
@@ -1371,7 +1378,7 @@ function botThrowAtGoal(b) {
   whoosh(volAt(b.pos, 0.6));
 }
 function botPassTo(b, mate) {
-  v1.copy(mate.pos).addScaledVector(mate.vel, 0.4).sub(disc.pos).normalize().multiplyScalar(12.5);
+  v1.copy(mate.pos).addScaledVector(mate.vel, 0.4).sub(disc.pos).normalize().multiplyScalar(11);
   b.holdsDisc = false;
   dropDisc(v1);
   b.catchCd = 1.0;
@@ -1437,12 +1444,25 @@ function updateBots(dt) {
     const steer = Math.min(v2.length(), 10 * dt);
     b.steer = steer / Math.max(dt, 1e-4);
     v2.normalize().multiplyScalar(steer);
+    if (b.launch) {
+      b.vel.x = 0; b.vel.y = 0;
+      b.vel.z = THREE.MathUtils.clamp(b.vel.z + (b.team === 'blue' ? -14 : 14) * dt, -10, 10);
+      b.pos.addScaledVector(b.vel, dt);
+      if (Math.abs(b.pos.z) < 38.2) b.launch = false;
+      b.group.position.copy(b.pos);
+      continue;
+    }
     b.vel.add(v2);
     b.pos.addScaledVector(b.vel, dt);
     resolveSphere(b.pos, 0.42, b.vel, 0.25);
     // carry / throw
     if (b.holdsDisc) {
       b.holdT += dt;
+      if (calloutT > 0 && b.team === 'blue' && b.holdT > 0.25) {
+        passToPlayer(b);
+        calloutT = 0;
+        continue;
+      }
       attackGoalCenter(b.team, v4);
       const gd = b.pos.distanceTo(v4);
       const pressured = nearestEnemyDist(b) < 2.0;
@@ -1500,6 +1520,8 @@ const pv = {
   anchor: new THREE.Vector3(), grabVel: new THREE.Vector3()
 };
 const boostAccel = new THREE.Vector3();
+const boostDirTmp = new THREE.Vector3();
+let boostMaxT = 0;
 let brakeHeld = false, totThrottle = 0, toLobbyRequested = false;
 const hands = [];
 const HIST_N = 10;
@@ -1630,6 +1652,8 @@ function onSelect(h) {
 }
 let snapReady = true;
 function updateVRInput(dt) {
+  boostDirTmp.set(0, 0, 0);
+  boostMaxT = 0;
   for (const h of hands) {
     updateHandHist(h, dt);
     h.punchCd -= dt;
@@ -1641,8 +1665,10 @@ function updateVRInput(dt) {
     h.throttle = (pv.stunT > 0 || state === ST.COUNT) ? 0 : trig;
     if (h.throttle > 0.04 && pv.grabHand < 0) {
       h.ray.getWorldDirection(hDir).negate();
-      boostAccel.addScaledVector(hDir, 3.2 * h.throttle);
-      totThrottle += h.throttle;
+      // boosters don't stack: directions blend, strength is the strongest trigger
+      boostDirTmp.addScaledVector(hDir, h.throttle);
+      boostMaxT = Math.max(boostMaxT, h.throttle);
+      totThrottle += h.throttle * 0.5;
       if (h.throttle > 0.35 && Math.random() < 0.6) {
         handWorld(h, hTmp);
         particles.spawn(hTmp, 0x9fd8ff, 1, 2);
@@ -1653,7 +1679,10 @@ function updateVRInput(dt) {
     if (g.buttons[5] && g.buttons[5].pressed) {
       h.byT += dt;
       if (h.byT > 1.2 && state !== ST.LOBBY) { h.byT = -99; toLobbyRequested = true; }
-    } else h.byT = 0;
+    } else {
+      if (h.byT > 0.02 && h.byT < 0.35) doCallout(); // quick tap = "HERE!"
+      h.byT = 0;
+    }
     const ax = g.axes[2] || 0;
     if (h.handed === 'right') {
       if (Math.abs(ax) > 0.6 && snapReady) { snapTurn(Math.sign(ax) * -Math.PI / 4); snapReady = false; }
@@ -1672,6 +1701,9 @@ function updateVRInput(dt) {
       if (hTmp.distanceTo(disc.pos) < 0.42) pickupDisc('h' + h.i);
     }
   }
+  if (boostMaxT > 0.04 && boostDirTmp.lengthSq() > 1e-6) {
+    boostAccel.addScaledVector(boostDirTmp.normalize(), 2.4 * boostMaxT);
+  }
 }
 function snapTurn(ang) {
   camera.getWorldPosition(v3);
@@ -1681,7 +1713,11 @@ function snapTurn(ang) {
   rig.rotation.y += ang;
   beep(300, 0.04, 0.08, 'sine');
 }
-function teleportRig(targetHead, faceDir, feetY = null) {
+const teleA = new THREE.Vector3(), teleB = new THREE.Vector3();
+function teleportRig(targetHeadIn, faceDirIn, feetY = null) {
+  // copy args first — callers often pass the shared v1/v2 temps this function clobbers
+  const targetHead = teleA.copy(targetHeadIn);
+  const faceDir = teleB.copy(faceDirIn);
   camera.getWorldDirection(v1);
   v1.y = 0;
   if (v1.lengthSq() < 1e-6) v1.set(0, 0, -1);
@@ -1723,6 +1759,7 @@ addEventListener('keydown', e => {
   if (e.code === 'Escape' && state !== ST.LOBBY) toLobbyRequested = true;
   if (e.code === 'KeyE') deskGrabThrow();
   if (e.code === 'KeyF') deskPunch();
+  if (e.code === 'KeyH') doCallout();
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 renderer.domElement.addEventListener('pointerdown', e => {
@@ -1756,7 +1793,7 @@ function deskGrabThrow() {
   if (renderer.xr.isPresenting || state === ST.LOBBY || state === ST.COUNT || pv.stunT > 0) return;
   if (disc.state === 'held' && holderIsHand(disc.holder)) {
     camera.getWorldDirection(v1);
-    v1.multiplyScalar(16).addScaledVector(pv.vel, 0.5);
+    v1.multiplyScalar(13).addScaledVector(pv.vel, 0.5);
     dropDisc(v1, true);
     disc.spin = 18;
     whoosh(0.4);
@@ -1789,7 +1826,7 @@ function updateDesktopInput(dt) {
   if (state === ST.COUNT || pv.stunT > 0) return;
   camera.getWorldDirection(v1);
   v2.crossVectors(v1, UP).normalize();
-  const A = 6;
+  const A = 5;
   if (keys.KeyW) boostAccel.addScaledVector(v1, A);
   if (keys.KeyS) boostAccel.addScaledVector(v1, -A);
   if (keys.KeyA) boostAccel.addScaledVector(v2, -A);
@@ -1829,10 +1866,19 @@ function updatePlayerPhysics(dt) {
     if (!frozen) pv.vel.addScaledVector(boostAccel, dt);
     if (brakeHeld) pv.vel.multiplyScalar(Math.exp(-5 * dt));
     pv.vel.multiplyScalar(Math.exp(-0.035 * dt));
-    if (pv.vel.length() > 9) pv.vel.setLength(9);
+    if (pv.vel.length() > 8) pv.vel.setLength(8);
     if (!frozen) rig.position.addScaledVector(pv.vel, dt);
   }
   camera.getWorldPosition(headPos);
+  if (launchT > 0) {
+    // riding the launcher: ramp speed down the chute, no wall collision until clear
+    launchT -= dt;
+    const dirZ = (net.online ? net.myTeam : 'blue') === 'blue' ? -1 : 1;
+    pv.vel.x = 0; pv.vel.y = 0;
+    pv.vel.z = THREE.MathUtils.clamp(pv.vel.z + dirZ * 14 * dt, -10.5, 10.5);
+    if (Math.abs(headPos.z) < 38.2 || launchT <= 0) launchT = 0;
+    else return;
+  }
   v5.copy(headPos);
   resolveSphere(v5, 0.32, pv.grabHand >= 0 ? null : pv.vel, 0.1);
   if (colRes.hit) {
@@ -1944,6 +1990,7 @@ function doRoundReset() {
 }
 function startMatch(m) {
   mode = m;
+  if (m === 'match') net.initMic().catch(() => {}); // enables voice callouts vs bots
   score.blue = 0; score.orange = 0;
   sudden = false;
   matchClock = m === 'practice' ? 0 : MATCH_TIME;
@@ -2055,12 +2102,12 @@ function updateDisc(dt) {
   } else if (disc.state === 'free') {
     if (!frozen) {
       disc.pos.addScaledVector(disc.vel, dt);
-      resolveSphere(disc.pos, 0.16, disc.vel, 0.82);
+      resolveSphere(disc.pos, 0.16, disc.vel, 0.55);
       if (colRes.impact > 2) {
         thud(volAt(disc.pos, Math.min(0.5, colRes.impact * 0.05)), 400 + colRes.impact * 30);
         if (colRes.impact > 4) particles.spawn(disc.pos, 0x54d8ff, 8, 2);
       }
-      if (disc.vel.length() > 24) disc.vel.setLength(24);
+      if (disc.vel.length() > 18) disc.vel.setLength(18);
       checkGoalCrossing();
       if (net.online && net.isHost) {
         discNetT -= dt;
@@ -2092,6 +2139,9 @@ function updateDisc(dt) {
 }
 function updateStateMachine(dt) {
   stateT -= dt;
+  calloutT -= dt; calloutCd -= dt;
+  // shout into the mic -> "HERE!" callout (mic granted via VC or solo prompt)
+  if (net.micLevel > 0.11 && calloutCd <= 0 && state === ST.PLAY) doCallout();
   if (state === ST.COUNT) {
     const c = Math.ceil(stateT);
     if (c !== countLast && c > 0) {
@@ -2105,13 +2155,14 @@ function updateStateMachine(dt) {
       beep(1320, 0.3, 0.35);
       sbDirty = true;
       if (launchPending) {
-        // launch tubes fire everyone into the arena
+        // catapult sequence: accelerate down the chute, collisions off until clear of the wall
         launchPending = false;
+        launchT = 2.2;
         const dirZ = (net.online ? net.myTeam : 'blue') === 'blue' ? -1 : 1;
-        pv.vel.set(0, 0, dirZ * 8.5);
-        whoosh(0.5);
-        hapticPulse(0, 0.7, 120); hapticPulse(1, 0.7, 120);
-        if (mode === 'match') for (const b of bots) b.vel.set(0, 0, b.team === 'blue' ? -8.5 : 8.5);
+        pv.vel.set(0, 0, dirZ * 2);
+        whoosh(0.55);
+        hapticPulse(0, 0.9, 250); hapticPulse(1, 0.9, 250);
+        if (mode === 'match') for (const b of bots) { b.vel.set(0, 0, b.team === 'blue' ? -2 : 2); b.launch = true; }
       }
     }
   } else if (state === ST.PLAY) {
@@ -2222,6 +2273,23 @@ function updateAudioFrame() {
   boostFilter.frequency.setTargetAtTime(400 + speed * 25 + totThrottle * 250, AC.currentTime, 0.08);
 }
 
+// ---------------------------------------------------------------- "HERE!" callouts
+function doCallout() {
+  if (calloutCd > 0 || state !== ST.PLAY) return;
+  calloutCd = 1.6;
+  calloutT = 3;
+  beep(990, 0.1, 0.3);
+  beep(1320, 0.1, 0.25);
+  if (net.online) net.send('here', { i: net.myId });
+}
+function passToPlayer(b) {
+  v1.copy(headPos).addScaledVector(pv.vel, 0.35).sub(disc.pos).normalize().multiplyScalar(11);
+  b.holdsDisc = false;
+  dropDisc(v1);
+  b.catchCd = 1.0;
+  whoosh(volAt(b.pos, 0.5));
+}
+
 // ---------------------------------------------------------------- multiplayer wiring
 function sendPoseMaybe(dt) {
   if (!net.online || state === ST.LOBBY) return;
@@ -2279,6 +2347,7 @@ net.cb.onThrow = p => {
 };
 net.cb.onStunned = () => stunPlayer(null);
 net.cb.onLeave = id => removeAvatar(id);
+net.cb.onHere = () => { beep(990, 0.1, 0.25); beep(1320, 0.1, 0.2); };
 
 // ---------------------------------------------------------------- VR hover for terminals
 function updateVRPanelHover() {

@@ -9,6 +9,7 @@ export const net = {
   queueSize: 0, roster: [], remotes: new Map(),
   myId: Math.random().toString(36).slice(2, 10),
   cb: {}, _c: null, _q: null, _r: null, _started: false, _auto: false,
+  _pcs: new Map(), _mic: null, micLevel: 0,
 
   client() {
     if (!this._c) this._c = window.supabase.createClient(SB_URL, SB_KEY, { realtime: { params: { eventsPerSecond: 25 } } });
@@ -62,8 +63,9 @@ export const net = {
       if (me) { this.myTeam = me.team; this.mySlot = me.slot; }
       this.isHost = this.roster.length > 0 && this.roster[0].id === this.myId;
       for (const id of [...this.remotes.keys()]) {
-        if (!this.roster.find(m => m.id === id)) { if (this.cb.onLeave) this.cb.onLeave(id); this.remotes.delete(id); }
+        if (!this.roster.find(m => m.id === id)) { if (this.cb.onLeave) this.cb.onLeave(id); this.remotes.delete(id); this._dropPeer(id); }
       }
+      this._startVoice();
       if (this.cb.onRoom) this.cb.onRoom();
       if (this._auto && this.isHost && this.roster.length >= 2 && !this._started) {
         setTimeout(() => this.startMatchNet(), 2500);
@@ -84,8 +86,78 @@ export const net = {
     on('end', p => { if (this.cb.onEnd) this.cb.onEnd(p); });
     on('tick', p => { if (this.cb.onTick) this.cb.onTick(p); });
     on('stun', p => { if (p.v === this.myId && this.cb.onStunned) this.cb.onStunned(); });
+    on('here', p => { if (this.cb.onHere) this.cb.onHere(p); });
+    on('rtc', p => this._onRtc(p));
     ch.subscribe(s => { if (s === 'SUBSCRIBED') ch.track({ t: this._joinT }); });
   },
+
+  // ---- voice chat (WebRTC full mesh, signaled over the room channel)
+  async initMic() {
+    if (this._mic !== undefined && this._mic !== null) return this._mic;
+    try {
+      this._mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ac.createMediaStreamSource(this._mic);
+      const an = ac.createAnalyser(); an.fftSize = 512;
+      src.connect(an);
+      const buf = new Uint8Array(an.frequencyBinCount);
+      const poll = () => {
+        an.getByteTimeDomainData(buf);
+        let s = 0;
+        for (let i = 0; i < buf.length; i++) { const d = (buf[i] - 128) / 128; s += d * d; }
+        this.micLevel = Math.sqrt(s / buf.length);
+        setTimeout(poll, 90);
+      };
+      poll();
+    } catch { this._mic = false; }
+    return this._mic;
+  },
+  async _startVoice() {
+    const mic = await this.initMic();
+    if (!mic || !this._r) return;
+    for (const m of this.roster) {
+      if (m.id !== this.myId && !this._pcs.has(m.id) && this.myId < m.id) this._makePC(m.id, true);
+    }
+  },
+  _makePC(peer, initiator) {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    this._pcs.set(peer, pc);
+    if (this._mic) for (const tr of this._mic.getTracks()) pc.addTrack(tr, this._mic);
+    pc.onicecandidate = e => { if (e.candidate) this.send('rtc', { to: peer, from: this.myId, k: 'ice', d: JSON.stringify(e.candidate) }); };
+    pc.ontrack = e => {
+      let el = document.getElementById('vc-' + peer);
+      if (!el) { el = document.createElement('audio'); el.id = 'vc-' + peer; el.autoplay = true; document.body.appendChild(el); }
+      el.srcObject = e.streams[0];
+    };
+    if (initiator) {
+      pc.createOffer().then(o => pc.setLocalDescription(o))
+        .then(() => this.send('rtc', { to: peer, from: this.myId, k: 'offer', d: JSON.stringify(pc.localDescription) }))
+        .catch(() => {});
+    }
+    return pc;
+  },
+  async _onRtc(p) {
+    if (p.to !== this.myId) return;
+    try {
+      let pc = this._pcs.get(p.from);
+      if (p.k === 'offer') {
+        await this.initMic();
+        if (!pc) pc = this._makePC(p.from, false);
+        await pc.setRemoteDescription(JSON.parse(p.d));
+        const a = await pc.createAnswer();
+        await pc.setLocalDescription(a);
+        this.send('rtc', { to: p.from, from: this.myId, k: 'answer', d: JSON.stringify(pc.localDescription) });
+      } else if (p.k === 'answer' && pc) await pc.setRemoteDescription(JSON.parse(p.d));
+      else if (p.k === 'ice' && pc) await pc.addIceCandidate(JSON.parse(p.d));
+    } catch {}
+  },
+  _dropPeer(id) {
+    const pc = this._pcs.get(id);
+    if (pc) { try { pc.close(); } catch {} this._pcs.delete(id); }
+    const el = document.getElementById('vc-' + id);
+    if (el) el.remove();
+  },
+  _stopVoice() { for (const id of [...this._pcs.keys()]) this._dropPeer(id); },
 
   startMatchNet() {
     if (!this._r || this._started) return;
@@ -96,6 +168,7 @@ export const net = {
   send(event, payload) { if (this._r) this._r.send({ type: 'broadcast', event, payload }); },
   leave() {
     this._leaveQueue();
+    this._stopVoice();
     if (this._r) { this.client().removeChannel(this._r); this._r = null; }
     this.online = false; this.isHost = false; this.status = 'idle';
     this.roomCode = null; this.roster = []; this.remotes.clear();
