@@ -50,8 +50,38 @@ addEventListener('resize', () => {
 });
 
 // ---------------------------------------------------------------- audio
-let AC = null, master, sfxGain, musicGain, noise, anthemBuf = null;
+let AC = null, master, sfxGain, musicGain, noise;
 let anthemSrc = null, anthemGain = null, boostGainNode = null, boostFilter = null;
+
+// selectable goal fanfares
+const FANFARES = [
+  { id: 'charge', name: 'CHARGE', file: 'fanfare-charge.mp3' },
+  { id: 'flamenco', name: 'FLAMENCO', file: 'fanfare-flamenco.mp3' },
+  { id: 'knockout', name: 'KNOCKOUT', file: 'fanfare-knockout.mp3' },
+  { id: 'phantom', name: 'THE PHANTOM', file: 'fanfare-phantom.mp3' },
+  { id: 'teatime', name: 'TEATIME', file: 'fanfare-teatime.mp3' },
+  { id: 'neon', name: 'NEON VICTORY', file: 'neon-victory.mp3' }
+];
+const fanfareBufs = new Map();
+let selectedFanfare = (() => {
+  try { const s = localStorage.getItem('nv_fanfare'); if (s && FANFARES.find(f => f.id === s)) return s; } catch {}
+  return 'charge';
+})();
+function ensureFanfare(id) {
+  if (!AC || fanfareBufs.has(id)) return Promise.resolve(fanfareBufs.get(id));
+  const f = FANFARES.find(x => x.id === id);
+  if (!f) return Promise.resolve(null);
+  fanfareBufs.set(id, null); // mark in-flight
+  return fetch('./' + f.file).then(r => r.arrayBuffer()).then(ab => AC.decodeAudioData(ab))
+    .then(buf => { fanfareBufs.set(id, buf); return buf; })
+    .catch(() => { fanfareBufs.delete(id); return null; });
+}
+function setFanfare(id) {
+  if (!FANFARES.find(f => f.id === id)) return;
+  selectedFanfare = id;
+  try { localStorage.setItem('nv_fanfare', id); } catch {}
+  ensureFanfare(id);
+}
 
 function unlockAudio() {
   if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
@@ -83,11 +113,8 @@ function unlockAudio() {
   const lfo = AC.createOscillator(); lfo.frequency.value = 0.07;
   const lfoG = AC.createGain(); lfoG.gain.value = 70;
   lfo.connect(lfoG); lfoG.connect(lp.frequency); lfo.start();
-  // anthem
-  fetch('./neon-victory.mp3').then(r => r.arrayBuffer())
-    .then(ab => AC.decodeAudioData(ab))
-    .then(buf => { anthemBuf = buf; })
-    .catch(() => {});
+  // preload the chosen goal fanfare
+  ensureFanfare(selectedFanfare);
 }
 
 function beep(f = 880, dur = 0.12, vol = 0.25, type = 'square') {
@@ -147,19 +174,43 @@ function horn() {
     o.connect(lp); o.start(t); o.stop(t + 1.6);
   }
 }
+function playFanfareBuf(buf, dur, vol, dest) {
+  if (!AC || !buf) return;
+  const t = AC.currentTime;
+  anthemSrc = AC.createBufferSource(); anthemSrc.buffer = buf;
+  anthemGain = AC.createGain();
+  anthemGain.gain.setValueAtTime(0.001, t);
+  anthemGain.gain.linearRampToValueAtTime(vol, t + 0.25);
+  anthemGain.gain.setTargetAtTime(0, t + dur, 0.4);
+  anthemSrc.connect(anthemGain); anthemGain.connect(dest || musicGain);
+  anthemSrc.start(t);
+  anthemSrc.stop(t + dur + 2.5);
+}
+// plays the selected goal fanfare (loads on demand if needed)
 function playAnthem(dur = 9) {
   if (!AC) return;
   stopAnthem(0.05);
-  if (!anthemBuf) return;
-  const t = AC.currentTime;
-  anthemSrc = AC.createBufferSource(); anthemSrc.buffer = anthemBuf;
-  anthemGain = AC.createGain();
-  anthemGain.gain.setValueAtTime(0.001, t);
-  anthemGain.gain.linearRampToValueAtTime(0.95, t + 0.25);
-  anthemGain.gain.setTargetAtTime(0, t + dur, 0.4);
-  anthemSrc.connect(anthemGain); anthemGain.connect(musicGain);
-  anthemSrc.start(t);
-  anthemSrc.stop(t + dur + 2.5);
+  const buf = fanfareBufs.get(selectedFanfare);
+  if (buf) playFanfareBuf(buf, dur, 0.95);
+  else ensureFanfare(selectedFanfare).then(b => { if (b && state === ST.GOAL || state === ST.END) playFanfareBuf(b, dur, 0.95); });
+}
+// short preview used from the lobby fanfare terminal
+let previewSrc = null;
+function previewFanfare(id) {
+  if (!AC) { unlockAudio(); }
+  if (!AC) return;
+  if (previewSrc) { try { previewSrc.stop(); } catch {} previewSrc = null; }
+  ensureFanfare(id).then(buf => {
+    if (!buf) return;
+    const t = AC.currentTime;
+    previewSrc = AC.createBufferSource(); previewSrc.buffer = buf;
+    const g = AC.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.9, t + 0.15);
+    g.gain.setTargetAtTime(0, t + 6, 0.4);
+    previewSrc.connect(g); g.connect(musicGain);
+    previewSrc.start(t); previewSrc.stop(t + 8.5);
+  });
 }
 function stopAnthem(fade = 0.5) {
   if (!AC || !anthemSrc) return;
@@ -714,6 +765,30 @@ function drawSolo(scr) {
   x.fillText('grip: grab & fling · trigger: boost · A/X: brake · punch = stun', 320, 428);
   scr.tex.needsUpdate = true;
 }
+function drawFanfare(scr) {
+  const x = scr.ctx, W = 640, H = 448;
+  scr.btns = [];
+  drawScreenBase(x, W, H, 'GOAL FANFARE');
+  x.fillStyle = '#89aed6'; x.font = '600 22px Arial';
+  x.fillText('tap to preview + set your goal anthem', W / 2, 96);
+  const cols = 2, rowH = 74, cw = 262, gap = 16;
+  FANFARES.forEach((f, i) => {
+    const cx = 40 + (i % cols) * (cw + gap);
+    const cy = 118 + Math.floor(i / cols) * (rowH + 12);
+    const sel = selectedFanfare === f.id;
+    const hov = uiHover === scr.idx + ':fan_' + f.id;
+    x.fillStyle = sel ? '#1c4a6e' : (hov ? '#1d3a66' : '#12233f');
+    x.beginPath(); x.roundRect(cx, cy, cw, rowH, 12); x.fill();
+    x.strokeStyle = sel ? '#7aff9a' : (hov ? '#8fe0ff' : '#35b6ff'); x.lineWidth = sel ? 4 : 2; x.stroke();
+    x.fillStyle = sel ? '#eaffef' : '#bfe4ff';
+    x.textAlign = 'left';
+    x.font = '800 26px Arial';
+    x.fillText((sel ? '▶ ' : '') + f.name, cx + 20, cy + rowH / 2 + 9);
+    x.textAlign = 'center';
+    scr.btns.push({ id: 'fan_' + f.id, rect: [cx, cy, cw, rowH] });
+  });
+  scr.tex.needsUpdate = true;
+}
 function makeTerminal(idx, px, pz, drawFn) {
   const g = new THREE.Group();
   g.position.set(px, 0, pz);
@@ -823,6 +898,7 @@ function drawAllScreens() { for (const s of screens) s.draw(s); }
   makeTerminal(0, -5.5, 6.5, drawQuick);
   makeTerminal(1, 0, 7.5, drawPrivate);
   makeTerminal(2, 5.5, 6.5, drawSolo);
+  makeTerminal(3, -10.5, 3, drawFanfare);
   drawAllScreens();
   // spinning disc replica above the private terminal
   holoDisc = new THREE.Group();
@@ -1140,74 +1216,124 @@ function mergeParts(parts) {
   out.setAttribute('color', new THREE.BufferAttribute(col, 3));
   return out;
 }
-function buildBotGeos(teamHex) {
-  const T = teamHex, TD = dimHex(teamHex, 0.45);
-  const A = 0x10182b, B = 0x1a2440, M = 0x232f52;
-  const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
-  const sph = (r, ws = 10, hs = 8) => new THREE.SphereGeometry(r, ws, hs);
-  const body = mergeParts([
-    // pelvis + waist glow
-    { geo: box(0.3, 0.18, 0.2), color: A, y: -0.44 },
-    { geo: box(0.32, 0.05, 0.22), color: T, y: -0.33 },
-    // chest / abdomen / collar
-    { geo: box(0.44, 0.34, 0.26), color: M, y: 0.02 },
-    { geo: box(0.34, 0.2, 0.22), color: A, y: -0.2 },
-    { geo: box(0.3, 0.08, 0.2), color: A, y: 0.24 },
-    // chest core ring (faces forward)
-    { geo: new THREE.TorusGeometry(0.08, 0.024, 6, 20), color: T, y: 0.06, z: 0.14 },
-    // helmet + visor + jaw vent
-    { geo: sph(0.145, 12, 10), color: B, y: 0.43, sy: 1.12, sz: 1.05 },
-    { geo: box(0.23, 0.075, 0.05), color: T, y: 0.44, z: 0.115 },
-    { geo: box(0.12, 0.05, 0.08), color: A, y: 0.31, z: 0.08 },
-    // shoulder pads
-    { geo: sph(0.095, 8, 6), color: M, x: 0.28, y: 0.18, sy: 0.75 },
-    { geo: sph(0.095, 8, 6), color: M, x: -0.28, y: 0.18, sy: 0.75 },
-    // thruster backpack + spine glow + nozzles
-    { geo: box(0.3, 0.36, 0.14), color: A, y: 0.04, z: -0.2 },
-    { geo: box(0.04, 0.3, 0.02), color: TD, y: 0.04, z: -0.28 },
-    { geo: cylZ(0.05, 0.1), color: B, x: 0.09, y: -0.08, z: -0.3 },
-    { geo: cylZ(0.05, 0.1), color: B, x: -0.09, y: -0.08, z: -0.3 },
-    { geo: box(0.07, 0.07, 0.03), color: T, x: 0.09, y: -0.08, z: -0.36 },
-    { geo: box(0.07, 0.07, 0.03), color: T, x: -0.09, y: -0.08, z: -0.36 },
-    // legs in a relaxed zero-g pose
-    { geo: box(0.14, 0.32, 0.16), color: B, x: 0.1, y: -0.64, z: 0.03, rx: 0.3 },
-    { geo: box(0.14, 0.32, 0.16), color: B, x: -0.1, y: -0.64, z: 0.03, rx: 0.3 },
-    { geo: box(0.115, 0.3, 0.13), color: A, x: 0.11, y: -0.92, z: -0.05, rx: -0.35 },
-    { geo: box(0.115, 0.3, 0.13), color: A, x: -0.11, y: -0.92, z: -0.05, rx: -0.35 },
-    { geo: box(0.13, 0.09, 0.22), color: B, x: 0.11, y: -1.08 },
-    { geo: box(0.13, 0.09, 0.22), color: B, x: -0.11, y: -1.08 },
-    { geo: box(0.14, 0.025, 0.23), color: T, x: 0.11, y: -1.03 },
-    { geo: box(0.14, 0.025, 0.23), color: T, x: -0.11, y: -1.03 }
-  ]);
-  const armGeo = () => mergeParts([
-    { geo: sph(0.07, 8, 6), color: M },
-    { geo: box(0.1, 0.26, 0.12), color: B, y: -0.17, z: 0.02, rx: 0.25 },
-    { geo: sph(0.06, 8, 6), color: A, y: -0.31, z: 0.06 },
-    { geo: box(0.09, 0.24, 0.11), color: M, y: -0.44, z: 0.13, rx: 0.55 },
-    { geo: box(0.11, 0.05, 0.13), color: T, y: -0.55, z: 0.19 },
-    { geo: box(0.09, 0.11, 0.14), color: B, y: -0.63, z: 0.24 }
-  ]);
-  return { body, armL: armGeo(), armR: armGeo() };
+// ---- lighting (only affects the lit player materials; the neon world uses MeshBasic and is unlit)
+scene.add(new THREE.HemisphereLight(0x9cc4ff, 0x0a1220, 1.2));
+const keyLight = new THREE.DirectionalLight(0xdfeeff, 0.9); keyLight.position.set(4, 10, 6); scene.add(keyLight);
+const rimLight = new THREE.DirectionalLight(0x5fa8ff, 0.45); rimLight.position.set(-5, -3, -7); scene.add(rimLight);
+
+// ---- player body material (GLB humanoid, team-tinted) + arm segments
+function teamBodyMat(hex) {
+  return new THREE.MeshStandardMaterial({ color: 0x2a3450, emissive: hex, emissiveIntensity: 0.3, metalness: 0.4, roughness: 0.5, side: THREE.DoubleSide });
 }
-const BOT_GEOS = { blue: buildBotGeos(BLUE), orange: buildBotGeos(ORANGE) };
+const PLAYER_MAT = { blue: teamBodyMat(BLUE), orange: teamBodyMat(ORANGE) };
+// mesh analysis: toes + nose protrude toward +Z, so the model already faces this game's forward (+Z)
+const BODY_SCALE = 0.72, BODY_YAW = 0, BODY_OFFSET_Y = 0;
+
+// ---- shared hand geometry (a stylized gauntlet: palm, knuckles, fingers, thumb)
+const HAND_GEO = (() => {
+  const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+  const g = mergeParts([
+    { geo: box(0.085, 0.1, 0.05), color: 0xffffff, y: 0 },
+    { geo: box(0.085, 0.03, 0.052), color: 0xffffff, y: 0.06 },
+    { geo: box(0.019, 0.055, 0.045), color: 0xffffff, x: -0.028, y: 0.1 },
+    { geo: box(0.019, 0.065, 0.045), color: 0xffffff, x: -0.0095, y: 0.11 },
+    { geo: box(0.019, 0.065, 0.045), color: 0xffffff, x: 0.0095, y: 0.11 },
+    { geo: box(0.019, 0.055, 0.045), color: 0xffffff, x: 0.028, y: 0.1 },
+    { geo: box(0.03, 0.05, 0.04), color: 0xffffff, x: -0.055, y: 0.01, rz: 0.6 }
+  ]);
+  g.computeVertexNormals();
+  return g;
+})();
+function makeSeg(r0, r1) { return new THREE.CylinderGeometry(r0, r1, 1, 8); }
+const UPSEG_GEO = makeSeg(0.058, 0.05), FORESEG_GEO = makeSeg(0.05, 0.04);
+function makeArmRig(mat) {
+  const upper = new THREE.Mesh(UPSEG_GEO, mat);
+  const fore = new THREE.Mesh(FORESEG_GEO, mat);
+  const hand = new THREE.Mesh(HAND_GEO, mat);
+  return { upper, fore, hand };
+}
+const ARM_L1 = 0.27, ARM_L2 = 0.27;
+const _seg = new THREE.Vector3(), _up01 = new THREE.Vector3(0, 1, 0);
+const _ikDir = new THREE.Vector3(), _ikBase = new THREE.Vector3(), _ikPole = new THREE.Vector3(), _elbow = new THREE.Vector3();
+function placeSeg(mesh, a, b) {
+  mesh.position.copy(a).lerp(b, 0.5);
+  _seg.copy(b).sub(a);
+  const len = _seg.length() || 1e-4;
+  mesh.scale.set(1, len, 1);
+  _seg.multiplyScalar(1 / len);
+  mesh.quaternion.setFromUnitVectors(_up01, _seg);
+}
+function solveElbow(S, H, L1, L2, pole, out) {
+  _ikDir.copy(H).sub(S);
+  let d = _ikDir.length();
+  if (d < 1e-4) { out.copy(S).addScaledVector(pole, L1); return; }
+  d = Math.min(d, L1 + L2 - 1e-3);
+  _ikDir.multiplyScalar(1 / _ikDir.length());
+  const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  _ikBase.copy(S).addScaledVector(_ikDir, a);
+  _ikPole.copy(pole).addScaledVector(_ikDir, -pole.dot(_ikDir));
+  if (_ikPole.lengthSq() < 1e-6) _ikPole.set(0, -1, 0).addScaledVector(_ikDir, -_ikDir.y);
+  _ikPole.normalize();
+  out.copy(_ikBase).addScaledVector(_ikPole, h);
+}
+function updateArm(rig, S, H, pole) {
+  solveElbow(S, H, ARM_L1, ARM_L2, pole, _elbow);
+  placeSeg(rig.upper, S, _elbow);
+  placeSeg(rig.fore, _elbow, H);
+  rig.hand.position.copy(H);
+  _seg.copy(H).sub(_elbow);
+  if (_seg.lengthSq() > 1e-6) { _seg.normalize(); rig.hand.quaternion.setFromUnitVectors(_up01, _seg); }
+}
+
+// ---- GLB player model (single static mesh) — dependency-free parse
+let playerGeo = null;
+const pendingBodies = [];
+function parseGLB(ab) {
+  const dv = new DataView(ab);
+  const jsonLen = dv.getUint32(12, true);
+  const json = JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 20, jsonLen)));
+  const binOffset = 20 + jsonLen + 8;
+  const prim = json.meshes[0].primitives[0];
+  const pa = json.accessors[prim.attributes.POSITION];
+  const ia = json.accessors[prim.indices];
+  const pv = json.bufferViews[pa.bufferView];
+  const iv = json.bufferViews[ia.bufferView];
+  const pos = new Float32Array(ab, binOffset + pv.byteOffset + (pa.byteOffset || 0), pa.count * 3).slice();
+  const idx = new Uint16Array(ab, binOffset + iv.byteOffset + (ia.byteOffset || 0), ia.count).slice();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
+  return geo;
+}
+function attachBody(group, team, offsetY = BODY_OFFSET_Y) {
+  if (!playerGeo) { pendingBodies.push({ group, team, offsetY }); return null; }
+  const m = new THREE.Mesh(playerGeo, PLAYER_MAT[team]);
+  m.scale.setScalar(BODY_SCALE);
+  m.rotation.y = BODY_YAW;
+  m.position.y = offsetY;
+  group.add(m);
+  group.userData.body = m;
+  return m;
+}
+fetch('./player.glb').then(r => r.arrayBuffer()).then(ab => {
+  playerGeo = parseGLB(ab);
+  for (const pb of pendingBodies) attachBody(pb.group, pb.team, pb.offsetY);
+  pendingBodies.length = 0;
+}).catch(e => console.warn('player.glb load failed', e));
 function makeBot(team, idx) {
   const col = team === 'blue' ? BLUE : ORANGE;
   const g = new THREE.Group();
-  const geos = BOT_GEOS[team];
-  g.add(new THREE.Mesh(geos.body, botMat));
-  const armL = new THREE.Mesh(geos.armL, botMat);
-  armL.position.set(-0.3, 0.18, 0);
-  g.add(armL);
-  const armR = new THREE.Mesh(geos.armR, botMat);
-  armR.position.set(0.3, 0.18, 0);
-  g.add(armR);
+  attachBody(g, team);
   const thr = new THREE.Sprite(new THREE.SpriteMaterial({ map: disc.glowTex, color: col, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
-  thr.position.set(0, -0.15, -0.42);
+  thr.position.set(0, -0.35, -0.42);
   thr.scale.setScalar(0.01);
   g.add(thr);
   scene.add(g);
   const bot = {
-    team, idx, group: g, thr, armL, armR,
+    team, idx, group: g, thr,
     pos: new THREE.Vector3(), vel: new THREE.Vector3(),
     stunT: 0, punchT: 0, catchCd: 0, holdsDisc: false, holdT: 0, aimT: 0,
     role: 'mid', lane: idx === 0 ? 0 : (idx === 1 ? -1 : 1), phase: Math.random() * 9,
@@ -1220,32 +1346,19 @@ makeBot('blue', 1); makeBot('blue', 2);
 makeBot('orange', 0); makeBot('orange', 1); makeBot('orange', 2);
 // ---------------------------------------------------------------- remote player avatars
 const avatars = new Map();
-function buildAvatarGeo(T) {
-  const A = 0x10182b, B = 0x1a2440, M = 0x232f52;
-  const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
-  return mergeParts([
-    { geo: new THREE.SphereGeometry(0.145, 12, 10), color: B, sy: 1.12, sz: 1.05 },
-    { geo: box(0.23, 0.075, 0.05), color: T, z: 0.115 },
-    { geo: box(0.3, 0.08, 0.2), color: A, y: -0.2 },
-    { geo: box(0.42, 0.32, 0.24), color: M, y: -0.42 },
-    { geo: new THREE.TorusGeometry(0.08, 0.024, 6, 20), color: T, y: -0.38, z: 0.13 },
-    { geo: box(0.28, 0.3, 0.12), color: A, y: -0.4, z: -0.19 },
-    { geo: box(0.26, 0.14, 0.18), color: A, y: -0.68 },
-    { geo: box(0.28, 0.04, 0.2), color: T, y: -0.6 }
-  ]);
-}
-const AV_GEOS = { blue: buildAvatarGeo(BLUE), orange: buildAvatarGeo(ORANGE) };
+const AVATAR_OFFSET_Y = -0.5; // drop the body so its head lines up with the tracked head pose
 function getAvatar(id) {
   let av = avatars.get(id);
   if (!av) {
     const team = net.teamOf(id);
-    const group = new THREE.Mesh(AV_GEOS[team], botMat);
+    const group = new THREE.Group();      // head-anchored: body hangs below, sways with head
+    attachBody(group, team, AVATAR_OFFSET_Y);
     scene.add(group);
-    const handGeo = new THREE.SphereGeometry(0.05, 8, 6);
-    const hm = new THREE.MeshBasicMaterial({ color: team === 'blue' ? BLUE : ORANGE, fog: false });
-    const hl = new THREE.Mesh(handGeo, hm), hr = new THREE.Mesh(handGeo, hm);
+    const mat = PLAYER_MAT[team];
+    const hl = new THREE.Mesh(HAND_GEO, mat), hr = new THREE.Mesh(HAND_GEO, mat);
+    hl.scale.setScalar(1.1); hr.scale.setScalar(1.1);
     scene.add(hl); scene.add(hr);
-    av = { group, hl, hr, team };
+    av = { group, hl, hr, team, hlT: new THREE.Vector3(), hrT: new THREE.Vector3() };
     avatars.set(id, av);
   }
   return av;
@@ -1271,6 +1384,9 @@ function updateRemotes(dt) {
     if (r.q) { qTmp.fromArray(r.q); av.group.quaternion.slerp(qTmp, k); }
     if (r.l) av.hl.position.lerp(v1.fromArray(r.l), k);
     if (r.rh) av.hr.position.lerp(v1.fromArray(r.rh), k);
+    // face the hand meshes roughly forward from the head
+    av.hl.quaternion.slerp(av.group.quaternion, k);
+    av.hr.quaternion.slerp(av.group.quaternion, k);
   }
 }
 function resetBots() {
@@ -1428,8 +1544,6 @@ function updateBots(dt) {
       qTmp.setFromAxisAngle(v1.set(0, 0, 1).normalize(), 3 * dt);
       b.quat.multiply(qTmp);
       b.group.quaternion.copy(b.quat);
-      b.armL.rotation.x = Math.sin(time * 13) * 0.7;
-      b.armR.rotation.x = Math.sin(time * 13 + 2) * 0.7;
       if (Math.random() < dt * 8) particles.spawn(b.pos, 0xfff37a, 2, 1.5);
       b.thr.scale.setScalar(0.01);
       continue;
@@ -1505,10 +1619,6 @@ function updateBots(dt) {
     eulTmp.set(Math.sin(time * 0.6 + b.phase) * 0.09, 0, Math.sin(time * 0.45 + b.phase * 2) * 0.11);
     qTmp.setFromEuler(eulTmp);
     b.group.quaternion.copy(b.quat).multiply(qTmp);
-    const spd = b.vel.length();
-    const pose = Math.min(1, spd / 4.5) * -1.15; // arms sweep back at speed
-    b.armL.rotation.x = pose + Math.sin(time * 2.1 + b.phase) * 0.12;
-    b.armR.rotation.x = pose + Math.sin(time * 2.1 + b.phase + 1.7) * 0.12;
     b.thr.scale.setScalar(0.08 + Math.min(0.6, b.steer * 0.05));
   }
 }
@@ -1547,13 +1657,12 @@ for (let i = 0; i < 2; i++) {
   ray.addEventListener('selectend', () => { h.selectDown = false; });
   ray.addEventListener('squeezestart', () => { unlockAudio(); h.gripDown = true; tryGrab(h); });
   ray.addEventListener('squeezeend', () => { h.gripDown = false; releaseGrab(h); });
-  // gauntlet: glove + knuckle + wrist band + booster nozzle
-  const glove = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.05, 0.12), new THREE.MeshBasicMaterial({ color: 0x232f52 }));
-  glove.position.set(0, -0.01, 0.02);
-  grip.add(glove);
-  const knuckle = new THREE.Mesh(new THREE.SphereGeometry(0.038, 10, 8), new THREE.MeshBasicMaterial({ color: 0xd8ecff }));
-  knuckle.position.set(0, 0.01, -0.03);
-  grip.add(knuckle);
+  // gauntlet: articulated hand + wrist band + booster nozzle
+  const hand = new THREE.Mesh(HAND_GEO, PLAYER_MAT.blue);
+  hand.position.set(0, 0, -0.02);
+  hand.rotation.x = -Math.PI / 2; // fingers point forward (-Z)
+  grip.add(hand);
+  h.handMesh = hand;
   const band = new THREE.Mesh(new THREE.TorusGeometry(0.052, 0.015, 6, 18), new THREE.MeshBasicMaterial({ color: BLUE, fog: false }));
   band.position.z = 0.06;
   grip.add(band);
@@ -1580,6 +1689,38 @@ for (let i = 0; i < 2; i++) {
 }
 // attach boost sprite texture after disc glow texture exists
 for (const h of hands) h.boostSpr.material.map = disc.glowTex;
+
+// local player's own visible arms (upper + forearm, IK from shoulder to each controller)
+const localArms = [0, 1].map(() => ({
+  upper: new THREE.Mesh(UPSEG_GEO, PLAYER_MAT.blue),
+  fore: new THREE.Mesh(FORESEG_GEO, PLAYER_MAT.blue)
+}));
+for (const a of localArms) { a.upper.visible = a.fore.visible = false; scene.add(a.upper, a.fore); }
+const _sh = new THREE.Vector3(), _fwdH = new THREE.Vector3(), _rightH = new THREE.Vector3(), _poleH = new THREE.Vector3(), _handW = new THREE.Vector3();
+function updateLocalArms() {
+  const show = renderer.xr.isPresenting;
+  const team = net.online ? net.myTeam : 'blue';
+  const mat = PLAYER_MAT[team];
+  camera.getWorldDirection(_fwdH); _fwdH.y = 0;
+  if (_fwdH.lengthSq() < 1e-5) _fwdH.set(0, 0, -1);
+  _fwdH.normalize();
+  _rightH.crossVectors(_fwdH, UP).normalize();
+  _poleH.copy(UP).multiplyScalar(-1).addScaledVector(_fwdH, -0.55).normalize();
+  for (let i = 0; i < 2; i++) {
+    const a = localArms[i], h = hands[i];
+    const on = show && !!h.gamepad;
+    a.upper.visible = a.fore.visible = on;
+    if (h.handMesh) h.handMesh.material = mat;
+    if (!on) continue;
+    a.upper.material = a.fore.material = mat;
+    const side = h.handed === 'left' ? -1 : (h.handed === 'right' ? 1 : (i === 0 ? -1 : 1));
+    _sh.copy(headPos).addScaledVector(UP, -0.2).addScaledVector(_fwdH, -0.05).addScaledVector(_rightH, side * 0.2);
+    h.grip.getWorldPosition(_handW);
+    solveElbow(_sh, _handW, ARM_L1, ARM_L2, _poleH, _elbow);
+    placeSeg(a.upper, _sh, _elbow);
+    placeSeg(a.fore, _elbow, _handW);
+  }
+}
 
 function handWorld(h, out) { return h.grip.getWorldPosition(out); }
 function updateHandHist(h, dt) {
@@ -1959,6 +2100,7 @@ function clickUi(id) {
   else if (a === 'leave') { net.leave(); termMode = 'root'; }
   else if (a === 'match') startMatch('match');
   else if (a === 'practice') startMatch('practice');
+  else if (a && a.indexOf('fan_') === 0) { const fid = a.slice(4); setFanfare(fid); previewFanfare(fid); }
   drawAllScreens();
 }
 
@@ -2421,6 +2563,7 @@ function loop() {
     updateBots(dt);
     updatePunches(dt);
   }
+  updateLocalArms();
   updateRemotes(dt);
   sendPoseMaybe(dt);
   updateStateMachine(dt);
@@ -2440,7 +2583,9 @@ renderer.setAnimationLoop(loop);
 // test hooks
 window.__nv = {
   get state() { return state; },
-  score, disc, bots, pv, net, avatars,
+  score, disc, bots, pv, net, avatars, screens, FANFARES,
+  get fanfare() { return selectedFanfare; },
+  setFanfare, previewFanfare, clickUi,
   startMatch,
   forceGoal: t => onGoal(t, t === 'blue' ? -1 : 1),
   drawCalls: () => renderer.info.render.calls
