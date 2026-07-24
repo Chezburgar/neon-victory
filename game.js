@@ -10,19 +10,25 @@ const ARENA_HW = 13, ARENA_HH = 8, ARENA_HZ = 40, CHAM = 17;   // octagonal pris
 const GOAL_Z = 38.6, GOAL_R = 1.5;                              // ring plane / radius
 const SCORE_LIMIT = 5, MATCH_TIME = 300;
 const LOBBY_Y = -80;
-const ST = { LOBBY: 0, COUNT: 1, PLAY: 2, GOAL: 3, END: 4 };
+const ST = { LOBBY: 0, COUNT: 1, PLAY: 2, GOAL: 3, END: 4, ROOM: 5 };
+const LAUNCH_LOCK = 15;          // seconds after entering a room before launchers arm
+const ROOM_PREMATCH = 60;        // pre-match staging time (late-join window)
+const ROOM_POSTGOAL = 20;        // after-goal staging time
+const ROOM_Z0 = 42, ROOM_Z1 = 53, ROOM_HW = 12, ROOM_HH = 7; // per-team chamber extents
 
 // temps
 const v1 = new THREE.Vector3(), v2 = new THREE.Vector3(), v3 = new THREE.Vector3();
 const v4 = new THREE.Vector3(), v5 = new THREE.Vector3(), v6 = new THREE.Vector3();
 const hTmp = new THREE.Vector3(), hDir = new THREE.Vector3(), headPos = new THREE.Vector3();
 const qTmp = new THREE.Quaternion();
+const qSpin = new THREE.Quaternion();
 const eulTmp = new THREE.Euler();
 const aimObj = new THREE.Object3D();
 
 let state = ST.LOBBY, stateT = 0, mode = 'match';
 let score = { blue: 0, orange: 0 }, matchClock = MATCH_TIME, sudden = false;
 let time = 0, countLast = 4, launchPending = false, launchT = 0;
+let roomT = 0, roomTotal = 0, launchArmed = false, playerLaunched = false, roomCountShown = -1;
 let poseT = 0, discNetT = 0, tickT = 0, calloutT = 0, calloutCd = 0;
 
 // ---------------------------------------------------------------- renderer / rig
@@ -113,8 +119,35 @@ function unlockAudio() {
   const lfo = AC.createOscillator(); lfo.frequency.value = 0.07;
   const lfoG = AC.createGain(); lfoG.gain.value = 70;
   lfo.connect(lfoG); lfoG.connect(lp.frequency); lfo.start();
-  // preload the chosen goal fanfare
+  // preload the chosen goal fanfare + background music
   ensureFanfare(selectedFanfare);
+  loadBGM();
+}
+
+// looping background music (the Joust track)
+let bgmBuf = null, bgmSrc = null, bgmGain = null;
+const BGM_VOL = 0.34;
+function loadBGM() {
+  if (!AC || bgmBuf) return;
+  fetch('./joust-bgm.mp3').then(r => r.arrayBuffer()).then(ab => AC.decodeAudioData(ab))
+    .then(buf => { bgmBuf = buf; startBGM(); }).catch(() => {});
+}
+function startBGM() {
+  if (!AC || !bgmBuf || bgmSrc) return;
+  bgmSrc = AC.createBufferSource(); bgmSrc.buffer = bgmBuf; bgmSrc.loop = true;
+  bgmGain = AC.createGain();
+  bgmGain.gain.setValueAtTime(0.0001, AC.currentTime);
+  bgmGain.gain.setTargetAtTime(BGM_VOL, AC.currentTime, 2);
+  bgmSrc.connect(bgmGain); bgmGain.connect(musicGain);
+  bgmSrc.start();
+}
+function duckBGM(dur) {
+  if (!bgmGain) return;
+  const t = AC.currentTime;
+  bgmGain.gain.cancelScheduledValues(t);
+  bgmGain.gain.setValueAtTime(bgmGain.gain.value, t);
+  bgmGain.gain.setTargetAtTime(BGM_VOL * 0.15, t, 0.2);
+  bgmGain.gain.setTargetAtTime(BGM_VOL, t + dur, 1.2);
 }
 
 function beep(f = 880, dur = 0.12, vol = 0.25, type = 'square') {
@@ -190,6 +223,7 @@ function playFanfareBuf(buf, dur, vol, dest) {
 function playAnthem(dur = 9) {
   if (!AC) return;
   stopAnthem(0.05);
+  duckBGM(dur);
   const buf = fanfareBufs.get(selectedFanfare);
   if (buf) playFanfareBuf(buf, dur, 0.95);
   else ensureFanfare(selectedFanfare).then(b => { if (b && state === ST.GOAL || state === ST.END) playFanfareBuf(b, dur, 0.95); });
@@ -648,7 +682,96 @@ const TUBE_X = [0, -4, 4], TUBE_Y = -4.4;
 }
 function tubeSpawn(team, slot, out) {
   const endSign = team === 'blue' ? 1 : -1;
-  return out.set(TUBE_X[slot % 3], TUBE_Y, endSign * 42.6);
+  return out.set(TUBE_X[slot % 3], TUBE_Y, endSign * 46.5); // inside the launch room
+}
+// ---------------------------------------------------------------- launch rooms (staging chambers behind each wall)
+const LAUNCH_HANDLES = []; // { team, pos }
+const roomPanels = [];     // { end, ctx, tex }
+function roomBounds(team) {
+  const s = team === 'blue' ? 1 : -1;
+  return { hw: ROOM_HW, hh: ROOM_HH, zmin: s > 0 ? ROOM_Z0 : -ROOM_Z1, zmax: s > 0 ? ROOM_Z1 : -ROOM_Z0, cy: 0 };
+}
+function containInRoom(p, vel, team, r) {
+  const b = roomBounds(team);
+  if (p.x > b.hw - r) { p.x = b.hw - r; if (vel && vel.x > 0) vel.x *= -0.25; }
+  if (p.x < -(b.hw - r)) { p.x = -(b.hw - r); if (vel && vel.x < 0) vel.x *= -0.25; }
+  if (p.y > b.hh - r) { p.y = b.hh - r; if (vel && vel.y > 0) vel.y *= -0.25; }
+  if (p.y < -(b.hh - r)) { p.y = -(b.hh - r); if (vel && vel.y < 0) vel.y *= -0.25; }
+  if (p.z > b.zmax - r) { p.z = b.zmax - r; if (vel && vel.z > 0) vel.z *= -0.25; }
+  if (p.z < b.zmin + r) { p.z = b.zmin + r; if (vel && vel.z < 0) vel.z *= -0.25; }
+}
+{
+  const panelW = ROOM_HW * 2, panelH = ROOM_HH * 2;
+  for (const endSign of [-1, 1]) {
+    const col = endSign > 0 ? BLUE : ORANGE;
+    const cz0 = endSign > 0 ? ROOM_Z0 : -ROOM_Z1, cz1 = endSign > 0 ? ROOM_Z1 : -ROOM_Z0;
+    const cz = (cz0 + cz1) / 2, depth = cz1 - cz0;
+    const g = new THREE.Group();
+    arena.add(g);
+    const wallMatR = wallMat(6, 3.5, 0x8faede);
+    // back wall + side walls + floor + ceiling (front is the arena end wall with tube holes)
+    const back = new THREE.Mesh(new THREE.BoxGeometry(panelW + 0.6, panelH + 0.6, 0.3), wallMatR.clone());
+    back.position.set(0, 0, endSign > 0 ? cz1 : cz0); g.add(back);
+    for (const sx of [-1, 1]) {
+      const side = new THREE.Mesh(new THREE.BoxGeometry(0.3, panelH + 0.6, depth), wallMatR.clone());
+      side.position.set(sx * ROOM_HW, 0, cz); g.add(side);
+    }
+    const floor = new THREE.Mesh(new THREE.BoxGeometry(panelW, 0.3, depth), wallMatR.clone());
+    floor.position.set(0, -ROOM_HH, cz); g.add(floor);
+    const ceil = floor.clone(); ceil.position.y = ROOM_HH; g.add(ceil);
+    // countdown panel on the FRONT wall (above the tubes) so players see it while facing their launcher
+    const c = document.createElement('canvas'); c.width = 1024; c.height = 512;
+    const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+    const disp = new THREE.Mesh(new THREE.PlaneGeometry(13, 6.5),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, fog: false }));
+    disp.position.set(0, 1.2, endSign > 0 ? ROOM_Z0 + 0.3 : -(ROOM_Z0 + 0.3));
+    disp.rotation.y = endSign > 0 ? 0 : Math.PI; // face into the room toward the player
+    g.add(disp);
+    roomPanels.push({ end: endSign, ctx: c.getContext('2d'), tex });
+    // launch handles + tube collars at each launch slot (front of room)
+    const team = endSign > 0 ? 'blue' : 'orange';
+    for (const tx of TUBE_X) {
+      const hz = endSign > 0 ? ROOM_Z0 + 1.2 : -(ROOM_Z0 + 1.2);
+      const handle = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.06, 8, 20), new THREE.MeshBasicMaterial({ color: col, fog: false }));
+      handle.position.set(tx, TUBE_Y, hz);
+      handle.rotation.x = Math.PI / 2;
+      g.add(handle);
+      const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.0, 8), new THREE.MeshBasicMaterial({ color: 0xcfe6ff }));
+      bar.position.set(tx, TUBE_Y, hz);
+      g.add(bar);
+      LAUNCH_HANDLES.push({ team, pos: new THREE.Vector3(tx, TUBE_Y, hz) });
+    }
+  }
+}
+function drawRoomPanels() {
+  const armedIn = Math.max(0, LAUNCH_LOCK - (roomTotal - roomT));
+  const startIn = Math.max(0, roomT);
+  for (const rp of roomPanels) {
+    const x = rp.ctx, W = 1024, H = 512;
+    x.clearRect(0, 0, W, H);
+    x.fillStyle = 'rgba(8,14,26,0.9)';
+    x.beginPath(); x.roundRect(0, 0, W, H, 24); x.fill();
+    x.strokeStyle = '#2f5f9f'; x.lineWidth = 6; x.stroke();
+    x.textAlign = 'center';
+    x.fillStyle = '#8fe0ff'; x.font = '900 66px "Arial Black", Arial';
+    x.fillText(state === ST.ROOM ? 'LAUNCH BAY' : 'STANDBY', W / 2, 90);
+    if (state === ST.ROOM) {
+      if (!launchArmed) {
+        x.fillStyle = '#ffd54a'; x.font = '800 44px Arial';
+        x.fillText('LAUNCHERS ARM IN', W / 2, 180);
+        x.fillStyle = '#ffe9a0'; x.font = '900 200px "Arial Black", Arial';
+        x.fillText(String(Math.ceil(armedIn)), W / 2, 400);
+      } else {
+        x.fillStyle = '#7aff9a'; x.font = '900 60px "Arial Black", Arial';
+        x.fillText('GRAB HANDLE TO LAUNCH', W / 2, 200);
+        x.fillStyle = '#bfe4ff'; x.font = '700 40px Arial';
+        x.fillText('MATCH STARTS IN', W / 2, 300);
+        x.fillStyle = '#eaf6ff'; x.font = '900 150px "Arial Black", Arial';
+        x.fillText(fmtClock(startIn), W / 2, 450);
+      }
+    }
+    rp.tex.needsUpdate = true;
+  }
 }
 
 // stars
@@ -1043,6 +1166,14 @@ stunQuad.frustumCulled = false;
 camera.add(stunQuad);
 let fadeVal = 0, fadeTarget = 0, fadeSpeed = 3, fadeCb = null;
 function fadeTo(target, speed, cb) { fadeTarget = target; fadeSpeed = speed; fadeCb = cb || null; }
+// shield bubble shown in front of the face while shielding
+const shieldDome = new THREE.Mesh(new THREE.SphereGeometry(0.45, 20, 14),
+  new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, wireframe: true, fog: false }));
+shieldDome.position.z = -0.25;
+shieldDome.renderOrder = 950;
+shieldDome.frustumCulled = false;
+shieldDome.visible = false;
+camera.add(shieldDome);
 
 // ---------------------------------------------------------------- particles
 const PART_N = 600;
@@ -1100,8 +1231,17 @@ const particles = (() => {
 const disc = {
   state: 'free', holder: null, noCatchT: 0,
   pos: new THREE.Vector3(0, 0, 0), vel: new THREE.Vector3(), prevPos: new THREE.Vector3(),
-  spin: 4, yaw: 0, mesh: null, glow: null
+  spin: 4, yaw: 0, normal: new THREE.Vector3(0, 1, 0), mesh: null, glow: null
 };
+// a thrown disc banks along its flight direction instead of staying perfectly flat
+const _discN = new THREE.Vector3();
+function setDiscNormalFromThrow() {
+  const s = disc.vel.length();
+  if (s < 0.2) { disc.normal.set(0, 1, 0); return; }
+  _discN.copy(disc.vel).multiplyScalar(1 / s);
+  // tilt the disc plane so its leading edge lifts into the throw (banked frisbee look)
+  disc.normal.copy(UP).addScaledVector(_discN, -0.5).normalize();
+}
 {
   const g = new THREE.Group();
   const body = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 0.045, 24), new THREE.MeshBasicMaterial({ color: 0x0d1526 }));
@@ -1160,16 +1300,18 @@ function dropDisc(vel, broadcast) {
   disc.state = 'free'; disc.holder = null;
   disc.vel.copy(vel);
   disc.noCatchT = 0.35;
+  setDiscNormalFromThrow();
   if (broadcast && net.online) {
     net.send('throw', {
       p: disc.pos.toArray().map(n => +n.toFixed(2)),
-      v: disc.vel.toArray().map(n => +n.toFixed(2))
+      v: disc.vel.toArray().map(n => +n.toFixed(2)),
+      n: disc.normal.toArray().map(n => +n.toFixed(2))
     });
   }
 }
 function throwDiscFromHand(h) {
-  v1.copy(h.vel).lerp(h.velS, 0.35).multiplyScalar(1.1);
-  if (v1.length() > 16) v1.setLength(16);
+  v1.copy(h.vel).lerp(h.velS, 0.35);
+  if (v1.length() > 12) v1.setLength(12); // slower throws
   dropDisc(v1, true);
   disc.spin = 6 + v1.length();
   whoosh(Math.min(0.45, 0.1 + v1.length() * 0.02));
@@ -1221,11 +1363,34 @@ scene.add(new THREE.HemisphereLight(0x9cc4ff, 0x0a1220, 1.2));
 const keyLight = new THREE.DirectionalLight(0xdfeeff, 0.9); keyLight.position.set(4, 10, 6); scene.add(keyLight);
 const rimLight = new THREE.DirectionalLight(0x5fa8ff, 0.45); rimLight.position.set(-5, -3, -7); scene.add(rimLight);
 
-// ---- player body material (GLB humanoid, team-tinted) + arm segments
+// ---- player body material (GLB humanoid, per-vertex team colors) + arm segments
 function teamBodyMat(hex) {
-  return new THREE.MeshStandardMaterial({ color: 0x2a3450, emissive: hex, emissiveIntensity: 0.3, metalness: 0.4, roughness: 0.5, side: THREE.DoubleSide });
+  return new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, emissive: hex, emissiveIntensity: 0.14, metalness: 0.45, roughness: 0.45, side: THREE.DoubleSide });
 }
 const PLAYER_MAT = { blue: teamBodyMat(BLUE), orange: teamBodyMat(ORANGE) };
+// bake position-based vertex colors: dark suit, lighter torso panel, team-colored chest/visor/stripes, darker legs
+function tintForTeam(srcGeo, teamHex) {
+  const geo = srcGeo.clone();
+  const p = geo.attributes.position, n = p.count;
+  const col = new Float32Array(n * 3);
+  const tc = new THREE.Color(teamHex);
+  const cSuit = new THREE.Color(0x39435c), cPanel = new THREE.Color(0xdfeaff), cLeg = new THREE.Color(0x222a3e), cAccent = tc;
+  const tmp = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    tmp.copy(cSuit);
+    if (y < -0.35) tmp.lerp(cLeg, Math.min(1, (-0.35 - y) / 0.65));           // legs darker
+    if (y > -0.05 && y < 0.5 && z > 0.06) tmp.lerp(cPanel, 0.7);              // chest/front panel bright
+    if (y > 0.05 && y < 0.4 && z > 0.1 && Math.abs(x) < 0.12) tmp.copy(cAccent).multiplyScalar(1.3); // chest core
+    if (y > 0.7 && z > 0.02) tmp.lerp(cAccent, 0.75);                         // head visor band
+    if (Math.abs(x) > 0.27 && y > 0.0 && y < 0.35) tmp.lerp(cAccent, 0.5);    // shoulder accents
+    const stripe = 0.9 + 0.1 * Math.sin(x * 42 + y * 6);                      // subtle panel banding
+    col[i * 3] = tmp.r * stripe; col[i * 3 + 1] = tmp.g * stripe; col[i * 3 + 2] = tmp.b * stripe;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return geo;
+}
+const PLAYER_GEO = { blue: null, orange: null };
 // mesh analysis: toes + nose protrude toward +Z, so the model already faces this game's forward (+Z)
 const BODY_SCALE = 0.72, BODY_YAW = 0, BODY_OFFSET_Y = 0;
 
@@ -1309,8 +1474,8 @@ function parseGLB(ab) {
   return geo;
 }
 function attachBody(group, team, offsetY = BODY_OFFSET_Y) {
-  if (!playerGeo) { pendingBodies.push({ group, team, offsetY }); return null; }
-  const m = new THREE.Mesh(playerGeo, PLAYER_MAT[team]);
+  if (!PLAYER_GEO[team]) { pendingBodies.push({ group, team, offsetY }); return null; }
+  const m = new THREE.Mesh(PLAYER_GEO[team], PLAYER_MAT[team]);
   m.scale.setScalar(BODY_SCALE);
   m.rotation.y = BODY_YAW;
   m.position.y = offsetY;
@@ -1320,6 +1485,8 @@ function attachBody(group, team, offsetY = BODY_OFFSET_Y) {
 }
 fetch('./player.glb').then(r => r.arrayBuffer()).then(ab => {
   playerGeo = parseGLB(ab);
+  PLAYER_GEO.blue = tintForTeam(playerGeo, BLUE);
+  PLAYER_GEO.orange = tintForTeam(playerGeo, ORANGE);
   for (const pb of pendingBodies) attachBody(pb.group, pb.team, pb.offsetY);
   pendingBodies.length = 0;
 }).catch(e => console.warn('player.glb load failed', e));
@@ -1358,7 +1525,11 @@ function getAvatar(id) {
     const hl = new THREE.Mesh(HAND_GEO, mat), hr = new THREE.Mesh(HAND_GEO, mat);
     hl.scale.setScalar(1.1); hr.scale.setScalar(1.1);
     scene.add(hl); scene.add(hr);
-    av = { group, hl, hr, team, hlT: new THREE.Vector3(), hrT: new THREE.Vector3() };
+    const bubble = new THREE.Mesh(new THREE.SphereGeometry(0.5, 18, 12),
+      new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, wireframe: true, fog: false }));
+    bubble.visible = false;
+    scene.add(bubble);
+    av = { group, hl, hr, bubble, team, shielding: false, hlT: new THREE.Vector3(), hrT: new THREE.Vector3() };
     avatars.set(id, av);
   }
   return av;
@@ -1366,7 +1537,7 @@ function getAvatar(id) {
 function removeAvatar(id) {
   const av = avatars.get(id);
   if (!av) return;
-  scene.remove(av.group); scene.remove(av.hl); scene.remove(av.hr);
+  scene.remove(av.group); scene.remove(av.hl); scene.remove(av.hr); scene.remove(av.bubble);
   avatars.delete(id);
 }
 function updateRemotes(dt) {
@@ -1387,6 +1558,11 @@ function updateRemotes(dt) {
     // face the hand meshes roughly forward from the head
     av.hl.quaternion.slerp(av.group.quaternion, k);
     av.hr.quaternion.slerp(av.group.quaternion, k);
+    // shield bubble
+    av.shielding = !!r.sh;
+    av.bubble.position.copy(av.group.position);
+    av.bubble.visible = av.shielding;
+    av.bubble.material.opacity = av.shielding ? 0.32 + 0.18 * Math.sin(time * 20) : 0;
   }
 }
 function resetBots() {
@@ -1486,15 +1662,15 @@ function botThrowAtGoal(b) {
   const err = 0.35 + d * 0.028;
   v4.x += (Math.random() - 0.5) * 2 * err;
   v4.y += (Math.random() - 0.5) * 2 * err;
-  v1.copy(v4).sub(disc.pos).normalize().multiplyScalar(13);
+  v1.copy(v4).sub(disc.pos).normalize().multiplyScalar(10.5);
   b.holdsDisc = false;
   dropDisc(v1);
-  disc.spin = 16;
+  disc.spin = 13;
   b.catchCd = 1.0;
   whoosh(volAt(b.pos, 0.6));
 }
 function botPassTo(b, mate) {
-  v1.copy(mate.pos).addScaledVector(mate.vel, 0.4).sub(disc.pos).normalize().multiplyScalar(11);
+  v1.copy(mate.pos).addScaledVector(mate.vel, 0.4).sub(disc.pos).normalize().multiplyScalar(9);
   b.holdsDisc = false;
   dropDisc(v1);
   b.catchCd = 1.0;
@@ -1548,6 +1724,27 @@ function updateBots(dt) {
       b.thr.scale.setScalar(0.01);
       continue;
     }
+    if (state === ST.ROOM) {
+      if (b.launch) {
+        b.vel.x *= Math.exp(-3 * dt); b.vel.y *= Math.exp(-3 * dt);
+        b.vel.z = THREE.MathUtils.clamp(b.vel.z + (b.team === 'blue' ? -14 : 14) * dt, -10, 10);
+        b.pos.addScaledVector(b.vel, dt);
+        if (Math.abs(b.pos.z) < 38.2) b.launch = false;
+        b.thr.scale.setScalar(0.5);
+      } else {
+        // idle float, contained to the launch room
+        b.vel.multiplyScalar(Math.exp(-1.5 * dt));
+        b.pos.addScaledVector(b.vel, dt);
+        b.pos.y += Math.sin(time * 0.9 + b.phase * 3) * 0.15 * dt;
+        containInRoom(b.pos, b.vel, b.team, 0.42);
+        b.thr.scale.setScalar(0.05);
+      }
+      b.group.position.copy(b.pos);
+      eulTmp.set(Math.sin(time * 0.6 + b.phase) * 0.1, 0, Math.sin(time * 0.45 + b.phase * 2) * 0.12);
+      qTmp.setFromEuler(eulTmp);
+      b.group.quaternion.copy(b.quat).multiply(qTmp);
+      continue;
+    }
     if (frozen) { b.group.position.copy(b.pos); continue; }
     botTargetFor(b, b.target);
     v1.copy(b.target).sub(b.pos);
@@ -1591,11 +1788,14 @@ function updateBots(dt) {
         b.holdsDisc = true; b.holdT = 0;
       }
     }
-    // orange bots punch the player when they hold the disc
+    // orange bots lunge at the player's head; a raised shield reflects the stun back onto the bot
     if (b.team === 'orange' && disc.state === 'held' && holderIsHand(disc.holder)) {
       if (b.punchT <= 0 && b.pos.distanceTo(headPos) < 1.15) {
         b.punchT = 1.6;
-        if (Math.random() < 0.7) stunPlayer(b);
+        if (Math.random() < 0.7) {
+          if (pv.shielding) { v1.copy(b.pos).sub(headPos).normalize().multiplyScalar(4); stunBot(b, v1); hapticPulse(0, 0.5, 80); hapticPulse(1, 0.5, 80); }
+          else stunPlayer(b);
+        }
       }
     }
     // soft separation
@@ -1627,8 +1827,11 @@ function updateBots(dt) {
 const pv = {
   vel: new THREE.Vector3(), stunT: 0,
   grabHand: -1, grabBot: null, grabOff: new THREE.Vector3(),
-  anchor: new THREE.Vector3(), grabVel: new THREE.Vector3()
+  anchor: new THREE.Vector3(), grabVel: new THREE.Vector3(),
+  shieldE: 1, shielding: false
 };
+const BOT_HEAD_Y = 0.5, HEAD_HIT_R = 0.32;
+function botHead(b, out) { return out.copy(b.pos).addScaledVector(UP, BOT_HEAD_Y); }
 const boostAccel = new THREE.Vector3();
 const boostDirTmp = new THREE.Vector3();
 let boostMaxT = 0;
@@ -1648,7 +1851,7 @@ for (let i = 0; i < 2; i++) {
     histP: Array.from({ length: HIST_N }, () => new THREE.Vector3()),
     histT: new Float64Array(HIST_N), histI: 0, histFill: 0,
     vel: new THREE.Vector3(), velS: new THREE.Vector3(), gripDown: false, selectDown: false,
-    punchCd: 0, byT: 0, menuWas: false, throttle: 0
+    punchCd: 0, byT: 0, menuWas: false, throttle: 0, charge: 0, fistCharged: false
   };
   hands.push(h);
   ray.addEventListener('connected', e => { h.handed = e.data.handedness || ''; h.gamepad = e.data.gamepad || null; });
@@ -1674,6 +1877,12 @@ for (let i = 0; i < 2; i++) {
   boostSpr.scale.setScalar(0.01);
   grip.add(boostSpr);
   h.boostSpr = boostSpr;
+  // fist charge glow (grows as the trigger is held)
+  const fistGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: null, color: 0xffe08a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+  fistGlow.position.set(0, 0.02, -0.04);
+  fistGlow.scale.setScalar(0.001);
+  grip.add(fistGlow);
+  h.fistGlow = fistGlow;
   // pointer ray (lobby UI)
   const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -4)]);
   const rayLine = new THREE.Line(rayGeo, new THREE.LineBasicMaterial({ color: 0x54d8ff, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
@@ -1688,7 +1897,7 @@ for (let i = 0; i < 2; i++) {
   wristMeshes.push(wh);
 }
 // attach boost sprite texture after disc glow texture exists
-for (const h of hands) h.boostSpr.material.map = disc.glowTex;
+for (const h of hands) { h.boostSpr.material.map = disc.glowTex; h.fistGlow.material.map = disc.glowTex; }
 
 // local player's own visible arms (upper + forearm, IK from shoulder to each controller)
 const localArms = [0, 1].map(() => ({
@@ -1744,6 +1953,12 @@ function updateHandHist(h, dt) {
 function tryGrab(h) {
   if (state === ST.COUNT || pv.stunT > 0) return;
   handWorld(h, hTmp);
+  // in the launch room: grabbing your launcher handle (once armed) flings you into the arena
+  if (state === ST.ROOM && launchArmed && !playerLaunched) {
+    for (const lh of LAUNCH_HANDLES) {
+      if (lh.team === myTeam() && hTmp.distanceTo(lh.pos) < 0.8) { doLaunchSelf(); return; }
+    }
+  }
   if (disc.state === 'free' && disc.noCatchT <= 0 && hTmp.distanceTo(disc.pos) < 0.45) {
     pickupDisc('h' + h.i);
     return;
@@ -1801,35 +2016,42 @@ function updateVRInput(dt) {
     const g = h.gamepad;
     h.wristMesh.visible = h.handed === 'left' && state !== ST.LOBBY;
     h.rayLine.visible = state === ST.LOBBY;
-    if (!g || !g.buttons) { h.throttle = 0; h.boostSpr.scale.setScalar(0.01); continue; }
+    if (!g || !g.buttons) {
+      h.throttle = 0; h.charge = Math.max(0, h.charge - dt * 3);
+      h.boostSpr.scale.setScalar(0.01); if (h.fistGlow) h.fistGlow.scale.setScalar(0.001);
+      continue;
+    }
+    const canAct = pv.stunT <= 0 && state !== ST.COUNT;
+    // --- TRIGGER charges the fist (combat only, in PLAY) ---
     const trig = g.buttons[0] ? g.buttons[0].value : 0;
-    h.throttle = (pv.stunT > 0 || state === ST.COUNT) ? 0 : trig;
-    if (h.throttle > 0.04 && pv.grabHand < 0) {
+    if (trig > 0.5 && canAct && state === ST.PLAY) h.charge = Math.min(1, h.charge + dt / 0.5);
+    else h.charge = Math.max(0, h.charge - dt / 0.3);
+    h.fistCharged = h.charge > 0.7;
+    if (h.fistGlow) {
+      h.fistGlow.scale.setScalar(0.01 + h.charge * 0.17);
+      h.fistGlow.material.opacity = 0.25 + 0.65 * h.charge;
+    }
+    // --- Y (left) / B (right) upper face button = directional boost (slow) ---
+    const boostBtn = !!(g.buttons[5] && g.buttons[5].pressed);
+    const thr = (boostBtn && canAct && pv.grabHand < 0) ? 1 : 0;
+    h.throttle = thr;
+    if (thr) {
       h.ray.getWorldDirection(hDir).negate();
-      // boosters don't stack: directions blend, strength is the strongest trigger
-      boostDirTmp.addScaledVector(hDir, h.throttle);
-      boostMaxT = Math.max(boostMaxT, h.throttle);
-      totThrottle += h.throttle * 0.5;
-      if (h.throttle > 0.35 && Math.random() < 0.6) {
-        handWorld(h, hTmp);
-        particles.spawn(hTmp, 0x9fd8ff, 1, 2);
-      }
+      boostDirTmp.addScaledVector(hDir, 1);
+      boostMaxT = 1;
+      totThrottle += 0.5;
+      if (Math.random() < 0.5) { handWorld(h, hTmp); particles.spawn(hTmp, 0x9fd8ff, 1, 1.5); }
     }
-    h.boostSpr.scale.setScalar(0.01 + h.throttle * 0.3);
+    h.boostSpr.scale.setScalar(0.01 + thr * 0.26);
+    // --- A / X = brake ---
     if (g.buttons[4] && g.buttons[4].pressed) brakeHeld = true;
-    if (g.buttons[5] && g.buttons[5].pressed) {
-      h.byT += dt;
-      if (h.byT > 1.2 && state !== ST.LOBBY) { h.byT = -99; toLobbyRequested = true; }
-    } else {
-      if (h.byT > 0.02 && h.byT < 0.35) doCallout(); // quick tap = "HERE!"
-      h.byT = 0;
-    }
+    // --- right stick = snap turn ---
     const ax = g.axes[2] || 0;
     if (h.handed === 'right') {
       if (Math.abs(ax) > 0.6 && snapReady) { snapTurn(Math.sign(ax) * -Math.PI / 4); snapReady = false; }
       if (Math.abs(ax) < 0.3) snapReady = true;
     }
-    // menu button (exposed at index >= 6 on some runtimes) -> return to lobby
+    // --- menu button -> lobby ---
     let menuNow = false;
     for (let bi = 6; bi < g.buttons.length; bi++) {
       if (g.buttons[bi] && g.buttons[bi].pressed) { menuNow = true; break; }
@@ -1843,7 +2065,7 @@ function updateVRInput(dt) {
     }
   }
   if (boostMaxT > 0.04 && boostDirTmp.lengthSq() > 1e-6) {
-    boostAccel.addScaledVector(boostDirTmp.normalize(), 2.4 * boostMaxT);
+    boostAccel.addScaledVector(boostDirTmp.normalize(), 1.7 * boostMaxT); // gentler boost
   }
 }
 function snapTurn(ang) {
@@ -1932,11 +2154,12 @@ addEventListener('pointerup', e => {
 });
 function deskGrabThrow() {
   if (renderer.xr.isPresenting || state === ST.LOBBY || state === ST.COUNT || pv.stunT > 0) return;
+  if (state === ST.ROOM) { if (launchArmed && !playerLaunched) doLaunchSelf(); return; }
   if (disc.state === 'held' && holderIsHand(disc.holder)) {
     camera.getWorldDirection(v1);
-    v1.multiplyScalar(13).addScaledVector(pv.vel, 0.5);
+    v1.multiplyScalar(10).addScaledVector(pv.vel, 0.5);
     dropDisc(v1, true);
-    disc.spin = 18;
+    disc.spin = 15;
     whoosh(0.4);
   } else if (disc.state === 'free' && disc.noCatchT <= 0 && headPos.distanceTo(disc.pos) < 2.2) {
     pickupDisc('h0');
@@ -2007,7 +2230,7 @@ function updatePlayerPhysics(dt) {
     if (!frozen) pv.vel.addScaledVector(boostAccel, dt);
     if (brakeHeld) pv.vel.multiplyScalar(Math.exp(-5 * dt));
     pv.vel.multiplyScalar(Math.exp(-0.035 * dt));
-    if (pv.vel.length() > 8) pv.vel.setLength(8);
+    if (pv.vel.length() > 5) pv.vel.setLength(5);
     if (!frozen) rig.position.addScaledVector(pv.vel, dt);
   }
   camera.getWorldPosition(headPos);
@@ -2021,37 +2244,67 @@ function updatePlayerPhysics(dt) {
     else return;
   }
   v5.copy(headPos);
-  resolveSphere(v5, 0.32, pv.grabHand >= 0 ? null : pv.vel, 0.1);
-  if (colRes.hit) {
+  if (state === ST.ROOM && !playerLaunched) {
+    containInRoom(v5, pv.grabHand >= 0 ? null : pv.vel, myTeam(), 0.32);
+  } else {
+    resolveSphere(v5, 0.32, pv.grabHand >= 0 ? null : pv.vel, 0.1);
+  }
+  if (colRes.hit || v5.distanceToSquared(headPos) > 1e-8) {
     rig.position.add(v6.copy(v5).sub(headPos));
-    if (colRes.impact > 3.5) { thud(Math.min(0.4, colRes.impact * 0.05), 260); hapticPulse(0, 0.3, 50); hapticPulse(1, 0.3, 50); }
+    if (colRes.hit && colRes.impact > 3.5) { thud(Math.min(0.4, colRes.impact * 0.05), 260); hapticPulse(0, 0.3, 50); hapticPulse(1, 0.3, 50); }
     camera.getWorldPosition(headPos);
   }
 }
-// punches (VR): fast hand into a bot
+// shield: both fists charged AND held near your head; drains energy, must recover
+const _gL = new THREE.Vector3(), _gR = new THREE.Vector3();
+function updateShield(dt) {
+  let want = false;
+  if (renderer.xr.isPresenting && state === ST.PLAY && pv.stunT <= 0 && pv.shieldE > 0.12) {
+    const h0 = hands[0], h1 = hands[1];
+    if (h0.fistCharged && h1.fistCharged) {
+      h0.grip.getWorldPosition(_gL); h1.grip.getWorldPosition(_gR);
+      if (_gL.distanceTo(headPos) < 0.42 && _gR.distanceTo(headPos) < 0.42) want = true;
+    }
+  }
+  pv.shielding = want;
+  if (want) pv.shieldE = Math.max(0, pv.shieldE - dt / 3.5);        // ~3.5s of shield
+  else pv.shieldE = Math.min(1, pv.shieldE + dt / 6);               // recharge over ~6s
+  const op = want ? 0.35 + 0.2 * Math.sin(time * 20) : 0;
+  shieldDome.material.opacity += (op - shieldDome.material.opacity) * Math.min(1, 12 * dt);
+  shieldDome.visible = shieldDome.material.opacity > 0.01;
+  if (want && Math.random() < dt * 30) { hapticPulse(0, 0.15, 20); hapticPulse(1, 0.15, 20); }
+}
+// punches (VR): a CHARGED fist striking an opponent's HEAD stuns them; a shielder reflects the stun
 function updatePunches(dt) {
   if (!renderer.xr.isPresenting || state !== ST.PLAY || pv.stunT > 0) return;
   for (const h of hands) {
-    if (h.punchCd > 0) continue;
+    if (h.punchCd > 0 || !h.fistCharged) continue;
     const speed = h.vel.length();
-    if (speed < 3.2) continue;
+    if (speed < 2.2) continue; // needs an actual jab
     handWorld(h, hTmp);
+    let hit = false;
     for (const b of bots) {
       if (b.stunT > 0 || !b.group.visible) continue;
-      if (hTmp.distanceTo(b.pos) < 0.62) {
-        h.punchCd = 0.5;
+      botHead(b, v2);
+      if (hTmp.distanceTo(v2) < HEAD_HIT_R) {
+        h.punchCd = 0.5; h.charge = 0; hit = true;
         v1.copy(h.vel);
         stunBot(b, v1);
         hapticPulse(h.i, 1, 90);
         break;
       }
     }
-    if (h.punchCd <= 0 && net.online) {
+    if (!hit && net.online) {
       for (const [id, av] of avatars) {
-        if (hTmp.distanceTo(av.group.position) < 0.7) {
-          h.punchCd = 0.6;
-          net.send('stun', { v: id });
-          particles.spawn(av.group.position, 0xfff37a, 20, 3);
+        if (hTmp.distanceTo(av.group.position) < HEAD_HIT_R + 0.05) {
+          h.punchCd = 0.6; h.charge = 0; hit = true;
+          if (av.shielding) {           // struck a raised shield -> attacker gets stunned
+            stunPlayer(null);
+            particles.spawn(headPos, 0x8fe8ff, 24, 3);
+          } else {
+            net.send('stun', { v: id });
+            particles.spawn(av.group.position, 0xfff37a, 20, 3);
+          }
           zap(0.4);
           hapticPulse(h.i, 1, 90);
           break;
@@ -2115,34 +2368,63 @@ function resetDisc() {
   for (const b of bots) { b.holdsDisc = false; }
   trailReset();
 }
-function resetPositions() {
+function myTeam() { return net.online ? net.myTeam : 'blue'; }
+function mySlot() { return net.online ? net.mySlot : 0; }
+// place the player + bots in their launch rooms and start the room countdown
+function enterRoom(duration) {
   resetDisc();
   resetBots();
-  const team = net.online ? net.myTeam : 'blue';
-  const slot = net.online ? net.mySlot : 0;
+  launchPending = false; launchT = 0; playerLaunched = false;
+  roomTotal = duration; roomT = duration; launchArmed = false; roomCountShown = -1;
+  const team = myTeam(), slot = mySlot();
   tubeSpawn(team, slot, v1);
+  v1.z += team === 'blue' ? 2.5 : -2.5; // stand back from the handle
   teleportRig(v1, v2.set(0, 0, team === 'blue' ? -1 : 1));
-  launchPending = true;
-}
-function doRoundReset() {
-  resetPositions();
-  state = ST.COUNT; stateT = 3.99; countLast = 4;
+  for (const b of bots) b.launched = false;
+  state = ST.ROOM;
   sbMessage = sudden ? 'SUDDEN DEATH' : '';
   sbDirty = true;
 }
-function startMatch(m) {
+function doRoundReset() { enterRoom(ROOM_POSTGOAL); }
+// launch the local player out of their tube into the arena
+function doLaunchSelf() {
+  if (playerLaunched) return;
+  playerLaunched = true;
+  launchT = 2.2;
+  const dirZ = myTeam() === 'blue' ? -1 : 1;
+  pv.vel.set(0, 0, dirZ * 2);
+  pv.grabHand = -1; pv.grabBot = null;
+  whoosh(0.55);
+  hapticPulse(0, 0.9, 250); hapticPulse(1, 0.9, 250);
+  if (!net.online && launchArmed) roomT = Math.min(roomT, 0.6); // solo: launching starts the match
+}
+function launchBot(b) {
+  if (b.launched) return;
+  b.launched = true; b.launch = true;
+  b.vel.set(0, 0, b.team === 'blue' ? -2 : 2);
+}
+function beginPlay() {
+  doLaunchSelf();
+  for (const b of bots) if (b.group.visible) launchBot(b);
+  state = ST.PLAY;
+  showMsg('GO!', null, '#8fe8ff', 0.7, true);
+  beep(1320, 0.3, 0.35);
+  sbDirty = true;
+}
+function startMatch(m, roomDur, roomTot) {
   mode = m;
-  if (m === 'match') net.initMic().catch(() => {}); // enables voice callouts vs bots
+  if (m === 'match' || m === 'online') net.initMic().catch(() => {}); // enables voice callouts
   score.blue = 0; score.orange = 0;
   sudden = false;
   matchClock = m === 'practice' ? 0 : MATCH_TIME;
   sbMessage = '';
   sbDirty = true;
   stopAnthem(0.4);
+  const dur = roomDur != null ? roomDur : (net.online ? ROOM_PREMATCH : Math.min(ROOM_PREMATCH, 24));
   fadeTo(1, 4, () => {
     for (const b of bots) b.group.visible = (m === 'match');
-    resetPositions();
-    state = ST.COUNT; stateT = 3.99; countLast = 4;
+    enterRoom(dur);
+    if (roomTot != null) roomTotal = roomTot;   // late joiner syncs to host's clock
     fadeTo(0, 2.2);
   });
 }
@@ -2216,7 +2498,7 @@ function checkGoalCrossing() {
 }
 function updateDisc(dt) {
   disc.noCatchT -= dt;
-  const frozen = state === ST.COUNT;
+  const frozen = state === ST.COUNT || state === ST.ROOM;
   if (disc.state === 'held') {
     if (holderIsHand(disc.holder)) {
       const h = hands[disc.holder === 'h0' ? 0 : 1];
@@ -2244,12 +2526,14 @@ function updateDisc(dt) {
   } else if (disc.state === 'free') {
     if (!frozen) {
       disc.pos.addScaledVector(disc.vel, dt);
-      resolveSphere(disc.pos, 0.16, disc.vel, 0.55);
+      resolveSphere(disc.pos, 0.16, disc.vel, 0.32); // low restitution: no more far bounces
       if (colRes.impact > 2) {
         thud(volAt(disc.pos, Math.min(0.5, colRes.impact * 0.05)), 400 + colRes.impact * 30);
         if (colRes.impact > 4) particles.spawn(disc.pos, 0x54d8ff, 8, 2);
+        setDiscNormalFromThrow(); // re-bank off the new direction after a bounce
       }
-      if (disc.vel.length() > 18) disc.vel.setLength(18);
+      disc.vel.multiplyScalar(Math.exp(-0.22 * dt)); // gentle air drag so it glides to a stop
+      if (disc.vel.length() > 13) disc.vel.setLength(13);
       checkGoalCrossing();
       if (net.online && net.isHost) {
         discNetT -= dt;
@@ -2257,23 +2541,26 @@ function updateDisc(dt) {
           discNetT = 0.12;
           net.send('disc', {
             p: disc.pos.toArray().map(n => +n.toFixed(2)),
-            v: disc.vel.toArray().map(n => +n.toFixed(2))
+            v: disc.vel.toArray().map(n => +n.toFixed(2)),
+            n: disc.normal.toArray().map(n => +n.toFixed(2))
           });
         }
       }
     }
     disc.mesh.position.copy(disc.pos);
-    // gyroscopic stabilization: settle flat while spinning for a clean glide
     disc.yaw += disc.spin * dt;
-    qTmp.setFromAxisAngle(UP, disc.yaw);
-    disc.mesh.quaternion.slerp(qTmp, Math.min(1, 7 * dt));
-    disc.spin *= Math.exp(-0.15 * dt);
+    // hold the banked flight attitude and spin about the disc's own axis
+    qTmp.setFromUnitVectors(_up01, disc.normal);
+    qSpin.setFromAxisAngle(_up01, disc.yaw);
+    disc.mesh.quaternion.copy(qTmp).multiply(qSpin);
+    disc.spin *= Math.exp(-0.12 * dt);
     trailPush();
   } else { // scored
     disc.mesh.position.copy(disc.pos);
     disc.yaw += 4 * dt;
-    qTmp.setFromAxisAngle(UP, disc.yaw);
-    disc.mesh.quaternion.slerp(qTmp, Math.min(1, 7 * dt));
+    qTmp.setFromUnitVectors(_up01, disc.normal);
+    qSpin.setFromAxisAngle(_up01, disc.yaw);
+    disc.mesh.quaternion.copy(qTmp).multiply(qSpin);
     disc.prevPos.copy(disc.pos);
   }
   const pulse = 1 + Math.sin(time * 5) * 0.12;
@@ -2284,28 +2571,21 @@ function updateStateMachine(dt) {
   calloutT -= dt; calloutCd -= dt;
   // shout into the mic -> "HERE!" callout (mic granted via VC or solo prompt)
   if (net.micLevel > 0.11 && calloutCd <= 0 && state === ST.PLAY) doCallout();
-  if (state === ST.COUNT) {
-    const c = Math.ceil(stateT);
-    if (c !== countLast && c > 0) {
-      countLast = c;
-      showMsg(String(c), mode === 'match' ? 'GET READY' : 'PRACTICE', '#eaf6ff', 1.1, true);
-      beep(660, 0.12, 0.3);
-    }
-    if (stateT <= 0) {
-      state = ST.PLAY;
-      showMsg('GO!', null, '#8fe8ff', 0.7, true);
-      beep(1320, 0.3, 0.35);
-      sbDirty = true;
-      if (launchPending) {
-        // catapult sequence: accelerate down the chute, collisions off until clear of the wall
-        launchPending = false;
-        launchT = 2.2;
-        const dirZ = (net.online ? net.myTeam : 'blue') === 'blue' ? -1 : 1;
-        pv.vel.set(0, 0, dirZ * 2);
-        whoosh(0.55);
-        hapticPulse(0, 0.9, 250); hapticPulse(1, 0.9, 250);
-        if (mode === 'match') for (const b of bots) { b.vel.set(0, 0, b.team === 'blue' ? -2 : 2); b.launch = true; }
+  if (state === ST.ROOM) {
+    roomT -= dt;
+    const elapsed = roomTotal - roomT;
+    const wasArmed = launchArmed;
+    launchArmed = elapsed >= LAUNCH_LOCK;
+    if (launchArmed && !wasArmed) { beep(1320, 0.18, 0.3); beep(990, 0.18, 0.25); }
+    // bots launch shortly after the launchers arm (staggered)
+    if (launchArmed && mode === 'match') {
+      for (const b of bots) {
+        if (b.group.visible && !b.launched && elapsed >= LAUNCH_LOCK + 0.6 + b.idx * 0.4 + (b.team === 'orange' ? 0.2 : 0)) launchBot(b);
       }
+    }
+    if (roomT <= 0) {
+      if (net.online && !net.isHost) { roomT = 0.2; } // wait for host 'begin'
+      else { if (net.online) net.send('begin', {}); beginPlay(); }
     }
   } else if (state === ST.PLAY) {
     if (mode !== 'practice') {
@@ -2364,6 +2644,16 @@ function updateHUD(dt) {
       drawWrist();
     }
     if (state === ST.LOBBY && (net.status !== 'idle' || uiHover)) drawAllScreens();
+    if (state === ST.ROOM) drawRoomPanels();
+  }
+  // room countdown: floating callouts at key beats
+  if (state === ST.ROOM) {
+    const secs = Math.ceil(roomT);
+    if (secs !== roomCountShown) {
+      roomCountShown = secs;
+      if (!launchArmed && secs === Math.ceil(roomTotal - LAUNCH_LOCK + 0.01)) { /* skip */ }
+      if (launchArmed && secs <= 5 && secs > 0) { showMsg(String(secs), 'MATCH START', '#8fe8ff', 0.9, true); beep(880, 0.1, 0.25); }
+    }
   }
   if (msgSprite.visible) {
     msgT -= dt;
@@ -2444,7 +2734,7 @@ function sendPoseMaybe(dt) {
   hands[1].grip.getWorldPosition(v2);
   let d = 0;
   if (disc.state === 'held') { if (disc.holder === 'h0') d = 1; else if (disc.holder === 'h1') d = 2; }
-  net.send('pose', { i: net.myId, p: r2(headPos.toArray()), q: r2(qTmp.toArray()), l: r2(v1.toArray()), r: r2(v2.toArray()), d });
+  net.send('pose', { i: net.myId, p: r2(headPos.toArray()), q: r2(qTmp.toArray()), l: r2(v1.toArray()), r: r2(v2.toArray()), d, sh: pv.shielding ? 1 : 0 });
   if (net.isHost && state === ST.PLAY) {
     tickT -= 0.1;
     if (tickT <= 0) {
@@ -2452,9 +2742,19 @@ function sendPoseMaybe(dt) {
       net.send('tick', { c: matchClock, sd: sudden ? 1 : 0, sb: score.blue, so: score.orange });
     }
   }
+  if (net.isHost && state === ST.ROOM) {
+    tickT -= 0.1;
+    if (tickT <= 0) { tickT = 1; net.send('room', { rt: roomT, tot: roomTotal }); }
+  }
 }
 net.cb.onStart = () => { termMode = 'root'; if (state === ST.LOBBY) startMatch('online'); };
 net.cb.onRoom = () => { if (state === ST.LOBBY) drawAllScreens(); };
+// host streams the room countdown so late joiners can drop straight into staging
+net.cb.onRoomSync = p => {
+  if (state === ST.LOBBY) startMatch('online', p.rt, p.tot);
+  else if (state === ST.ROOM) { roomT = p.rt; roomTotal = p.tot; launchArmed = (p.tot - p.rt) >= LAUNCH_LOCK; }
+};
+net.cb.onBegin = () => { if (state === ST.ROOM) beginPlay(); };
 net.cb.onGoal = p => { score.blue = p.sb; score.orange = p.so; if (state === ST.PLAY) onGoal(p.t, p.e, true); };
 net.cb.onReset = () => { if (state !== ST.LOBBY) doRoundReset(); };
 net.cb.onEnd = p => { if (state !== ST.LOBBY && state !== ST.END) endMatch(p.w, true); };
@@ -2471,6 +2771,7 @@ net.cb.onDisc = p => {
   if (disc.pos.distanceTo(v1) > 2.5) disc.pos.copy(v1);
   else disc.pos.lerp(v1, 0.35);
   disc.vel.fromArray(p.v);
+  if (p.n) disc.normal.fromArray(p.n);
 };
 net.cb.onGrab = p => {
   disc.state = 'held';
@@ -2484,6 +2785,7 @@ net.cb.onThrow = p => {
   disc.pos.fromArray(p.p);
   disc.prevPos.copy(disc.pos);
   disc.vel.fromArray(p.v);
+  if (p.n) disc.normal.fromArray(p.n); else setDiscNormalFromThrow();
   disc.noCatchT = 0.2;
   whoosh(volAt(disc.pos, 0.35));
 };
@@ -2561,6 +2863,7 @@ function loop() {
   if (state !== ST.LOBBY) {
     updateDisc(dt);
     updateBots(dt);
+    updateShield(dt);
     updatePunches(dt);
   }
   updateLocalArms();
@@ -2583,10 +2886,18 @@ renderer.setAnimationLoop(loop);
 // test hooks
 window.__nv = {
   get state() { return state; },
-  score, disc, bots, pv, net, avatars, screens, FANFARES,
+  get roomT() { return roomT; },
+  get launchArmed() { return launchArmed; },
+  get playerLaunched() { return playerLaunched; },
+  score, disc, bots, pv, net, avatars, screens, FANFARES, LAUNCH_HANDLES,
   get fanfare() { return selectedFanfare; },
   setFanfare, previewFanfare, clickUi,
   startMatch,
   forceGoal: t => onGoal(t, t === 'blue' ? -1 : 1),
-  drawCalls: () => renderer.info.render.calls
+  drawCalls: () => renderer.info.render.calls,
+  // headless test helpers (this environment can't run the rAF loop)
+  _testRoom: (dur) => { mode = 'match'; for (const b of bots) b.group.visible = true; enterRoom(dur || 24); },
+  _step: (dt) => { updateStateMachine(dt); if (state !== ST.LOBBY) updateBots(dt); },
+  _launch: () => doLaunchSelf(),
+  _snapshot: () => ({ state, roomT: +roomT.toFixed(2), armed: launchArmed, launched: playerLaunched, botsLaunched: bots.map(b => b.launched), discFrozen: state === ST.COUNT || state === ST.ROOM })
 };

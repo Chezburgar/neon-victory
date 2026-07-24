@@ -76,13 +76,15 @@ export const net = {
     on('pose', p => {
       let r = this.remotes.get(p.i);
       if (!r) { r = { id: p.i }; this.remotes.set(p.i, r); }
-      r.p = p.p; r.q = p.q; r.l = p.l; r.rh = p.r; r.d = p.d; r.lastT = performance.now();
+      r.p = p.p; r.q = p.q; r.l = p.l; r.rh = p.r; r.d = p.d; r.sh = p.sh; r.lastT = performance.now();
     });
     on('disc', p => { if (this.cb.onDisc) this.cb.onDisc(p); });
     on('grab', p => { if (this.cb.onGrab) this.cb.onGrab(p); });
     on('throw', p => { if (this.cb.onThrow) this.cb.onThrow(p); });
     on('goal', p => { if (this.cb.onGoal) this.cb.onGoal(p); });
     on('reset', p => { if (this.cb.onReset) this.cb.onReset(p); });
+    on('room', p => { if (this.cb.onRoomSync) this.cb.onRoomSync(p); });
+    on('begin', p => { if (this.cb.onBegin) this.cb.onBegin(p); });
     on('end', p => { if (this.cb.onEnd) this.cb.onEnd(p); });
     on('tick', p => { if (this.cb.onTick) this.cb.onTick(p); });
     on('stun', p => { if (p.v === this.myId && this.cb.onStunned) this.cb.onStunned(); });
